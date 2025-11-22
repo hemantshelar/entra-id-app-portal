@@ -409,7 +409,11 @@ entra-id-app-portal/
 │   ├── Services/
 │   │   └── IAppRegistrationService.cs    # HTTP client wrapper
 │   └── Models/
-│       └── ViewModels.cs
+│       ├── ViewModels.cs
+│       └── Options/                      # Configuration Options classes
+│           ├── AuthorizationOptions.cs
+│           ├── FeaturesOptions.cs
+│           └── SessionOptions.cs
 ├── entra-id-app-portal.ApiService/       # Backend API
 │   ├── Controllers/
 │   │   └── AppRegistrationsController.cs
@@ -419,15 +423,23 @@ entra-id-app-portal/
 │   │   ├── ICacheService.cs
 │   │   ├── CacheService.cs               # Cache management
 │   │   ├── IUserAuthorizationService.cs  # Group-based authorization
-│   │   └── UserAuthorizationService.cs   # Check user group membership
+│   │   ├── UserAuthorizationService.cs   # Check user group membership
+│   │   └── SecretService.cs              # Key Vault access
 │   ├── Models/
 │   │   ├── AppRegistrationDto.cs
-│   │   └── FilterOptions.cs
+│   │   ├── FilterOptions.cs
+│   │   └── Options/                      # Configuration Options classes
+│   │       ├── AzureAdOptions.cs
+│   │       ├── ManagedIdentityOptions.cs
+│   │       ├── GraphApiOptions.cs
+│   │       ├── KeyVaultOptions.cs
+│   │       └── CacheOptions.cs
 │   └── Repositories/
 │       ├── IAppRegistrationRepository.cs
 │       └── AppRegistrationRepository.cs
 ├── entra-id-app-portal.Core/             # Shared models/interfaces
 │   ├── Models/
+│   │   └── Options/                      # Shared Options classes (if needed)
 │   ├── Interfaces/
 │   └── Exceptions/
 └── entra-id-app-portal.Tests/            # Test projects
@@ -494,6 +506,99 @@ public class FilterOptions
     public string OwnerFilter { get; set; }
     public string PublisherDomain { get; set; }
     public ExpiryStatus? StatusFilter { get; set; }
+}
+```
+
+#### Configuration Options Classes (IOptions Pattern)
+
+**IMPORTANT**: Use strongly-typed configuration classes with IOptions pattern instead of accessing `IConfiguration` directly.
+
+```csharp
+// Models/Options/AzureAdOptions.cs
+public class AzureAdOptions
+{
+    public const string SectionName = "AzureAd";
+    
+    public string Instance { get; set; } = string.Empty;
+    public string TenantId { get; set; } = string.Empty;
+    public string ClientId { get; set; } = string.Empty;
+    public string ClientSecret { get; set; } = string.Empty;
+    public string CallbackPath { get; set; } = "/signin-oidc";
+    public string SignedOutCallbackPath { get; set; } = "/signout-callback-oidc";
+}
+
+// Models/Options/AuthorizationOptions.cs
+public class AuthorizationOptions
+{
+    public const string SectionName = "Authorization";
+    
+    public string AdminGroupId { get; set; } = string.Empty;
+    public string AdminGroupName { get; set; } = "Entra-Admin";
+    public string SupportGroupId { get; set; } = string.Empty;
+    public string SupportGroupName { get; set; } = "Entra-Support";
+    public bool RequireGroupMembership { get; set; } = true;
+    public int CacheGroupMembershipMinutes { get; set; } = 5;
+}
+
+// Models/Options/ManagedIdentityOptions.cs
+public class ManagedIdentityOptions
+{
+    public const string SectionName = "ManagedIdentity";
+    
+    public bool Enabled { get; set; }
+    public string ClientId { get; set; } = string.Empty;
+    public bool UseManagedIdentityForGraph { get; set; }
+}
+
+// Models/Options/GraphApiOptions.cs
+public class GraphApiOptions
+{
+    public const string SectionName = "GraphApi";
+    
+    public string BaseUrl { get; set; } = "https://graph.microsoft.com/v1.0";
+    public string[] Scopes { get; set; } = new[] { "https://graph.microsoft.com/.default" };
+    public int BatchSize { get; set; } = 999;
+    public int RetryAttempts { get; set; } = 3;
+    public int RetryDelaySeconds { get; set; } = 2;
+}
+
+// Models/Options/KeyVaultOptions.cs
+public class KeyVaultOptions
+{
+    public const string SectionName = "KeyVault";
+    
+    public string VaultUri { get; set; } = string.Empty;
+    public bool UseManagedIdentity { get; set; } = true;
+}
+
+// Models/Options/CacheOptions.cs
+public class CacheOptions
+{
+    public const string SectionName = "Cache";
+    
+    public int ExpirationMinutes { get; set; } = 60;
+    public bool EnableAutoRefresh { get; set; }
+    public int AutoRefreshIntervalMinutes { get; set; } = 30;
+}
+
+// Models/Options/FeaturesOptions.cs
+public class FeaturesOptions
+{
+    public const string SectionName = "Features";
+    
+    public bool EnableDelete { get; set; } = true;
+    public bool EnableExport { get; set; } = true;
+    public bool EnableBulkOperations { get; set; }
+    public bool AllowSupportRefresh { get; set; }
+}
+
+// Models/Options/SessionOptions.cs
+public class SessionOptions
+{
+    public const string SectionName = "Session";
+    
+    public int IdleTimeoutMinutes { get; set; } = 30;
+    public int AbsoluteTimeoutHours { get; set; } = 8;
 }
 ```
 
@@ -732,14 +837,35 @@ if (!string.IsNullOrEmpty(keyVaultUri))
 }
 
 // ============================================================================
-// STEP 5: Configure Options Pattern
+// STEP 5: Configure Options Pattern (Strongly-Typed Configuration)
 // ============================================================================
+// Register all configuration sections using IOptions pattern
 builder.Services.Configure<AzureAdOptions>(
-    builder.Configuration.GetSection("AzureAd"));
-builder.Services.Configure<GraphApiOptions>(
-    builder.Configuration.GetSection("GraphApi"));
+    builder.Configuration.GetSection(AzureAdOptions.SectionName));
+builder.Services.Configure<AuthorizationOptions>(
+    builder.Configuration.GetSection(AuthorizationOptions.SectionName));
 builder.Services.Configure<ManagedIdentityOptions>(
-    builder.Configuration.GetSection("ManagedIdentity"));
+    builder.Configuration.GetSection(ManagedIdentityOptions.SectionName));
+builder.Services.Configure<GraphApiOptions>(
+    builder.Configuration.GetSection(GraphApiOptions.SectionName));
+builder.Services.Configure<KeyVaultOptions>(
+    builder.Configuration.GetSection(KeyVaultOptions.SectionName));
+builder.Services.Configure<CacheOptions>(
+    builder.Configuration.GetSection(CacheOptions.SectionName));
+builder.Services.Configure<FeaturesOptions>(
+    builder.Configuration.GetSection(FeaturesOptions.SectionName));
+builder.Services.Configure<SessionOptions>(
+    builder.Configuration.GetSection(SessionOptions.SectionName));
+
+// Optional: Add validation for required configuration
+builder.Services.AddOptions<AuthorizationOptions>()
+    .Bind(builder.Configuration.GetSection(AuthorizationOptions.SectionName))
+    .ValidateDataAnnotations()
+    .ValidateOnStart();
+
+builder.Services.AddOptions<ManagedIdentityOptions>()
+    .Bind(builder.Configuration.GetSection(ManagedIdentityOptions.SectionName))
+    .ValidateOnStart();
 
 // ============================================================================
 // LOG CONFIGURATION SOURCE (Helpful for debugging)
@@ -1164,20 +1290,20 @@ public class GraphService : IGraphService
 {
     private readonly GraphServiceClient _graphClient;
     private readonly ILogger<GraphService> _logger;
-    private readonly IConfiguration _configuration;
+    private readonly GraphApiOptions _graphOptions;
 
     public GraphService(
         TokenCredential credential, // DefaultAzureCredential injected
-        IConfiguration configuration,
+        IOptions<GraphApiOptions> graphOptions,
         ILogger<GraphService> logger)
     {
-        _configuration = configuration;
+        _graphOptions = graphOptions.Value;
         _logger = logger;
 
         // Create Graph client with Managed Identity
         _graphClient = new GraphServiceClient(
             credential,
-            new[] { "https://graph.microsoft.com/.default" });
+            _graphOptions.Scopes);
     }
 
     public async Task<IEnumerable<Application>> GetApplicationsAsync(int top = 999)
@@ -1287,15 +1413,22 @@ public class SecretService : ISecretService
 
     public SecretService(
         TokenCredential credential, // DefaultAzureCredential injected
-        IConfiguration configuration,
+        IOptions<KeyVaultOptions> keyVaultOptions,
         ILogger<SecretService> logger)
     {
         _logger = logger;
-        var vaultUri = configuration["KeyVault:VaultUri"];
+        var options = keyVaultOptions.Value;
+
+        if (string.IsNullOrEmpty(options.VaultUri))
+        {
+            throw new InvalidOperationException("KeyVault:VaultUri configuration is missing or empty");
+        }
 
         _secretClient = new SecretClient(
-            new Uri(vaultUri!),
+            new Uri(options.VaultUri),
             credential); // Uses Managed Identity in Azure, developer creds locally
+        
+        _logger.LogInformation("SecretClient initialized for Key Vault: {VaultUri}", options.VaultUri);
     }
 
     public async Task<string> GetSecretAsync(string secretName)
@@ -2234,22 +2367,33 @@ public class UserAuthorizationService : IUserAuthorizationService
 {
     private readonly GraphServiceClient _graphClient;
     private readonly IHttpContextAccessor _httpContextAccessor;
-    private readonly IConfiguration _configuration;
+    private readonly AuthorizationOptions _authOptions;
     private readonly IMemoryCache _cache;
+    private readonly ILogger<UserAuthorizationService> _logger;
+
+    public UserAuthorizationService(
+        GraphServiceClient graphClient,
+        IHttpContextAccessor httpContextAccessor,
+        IOptions<AuthorizationOptions> authOptions,
+        IMemoryCache cache,
+        ILogger<UserAuthorizationService> logger)
+    {
+        _graphClient = graphClient;
+        _httpContextAccessor = httpContextAccessor;
+        _authOptions = authOptions.Value;
+        _cache = cache;
+        _logger = logger;
+    }
 
     public async Task<bool> IsAdministratorAsync()
     {
-        var adminGroupId = _configuration["Authorization:AdminGroupId"];
-        return await IsUserInGroupAsync(adminGroupId);
+        return await IsUserInGroupAsync(_authOptions.AdminGroupId);
     }
 
     public async Task<bool> IsAuthorizedUserAsync()
     {
-        var adminGroupId = _configuration["Authorization:AdminGroupId"];
-        var supportGroupId = _configuration["Authorization:SupportGroupId"];
-
-        return await IsUserInGroupAsync(adminGroupId) ||
-               await IsUserInGroupAsync(supportGroupId);
+        return await IsUserInGroupAsync(_authOptions.AdminGroupId) ||
+               await IsUserInGroupAsync(_authOptions.SupportGroupId);
     }
 
     private async Task<bool> IsUserInGroupAsync(string groupId)
@@ -2259,10 +2403,13 @@ public class UserAuthorizationService : IUserAuthorizationService
 
         if (string.IsNullOrEmpty(userId)) return false;
 
-        // Check cache first (5 minute TTL)
+        // Check cache first (configured TTL from AuthorizationOptions)
         var cacheKey = $"UserGroup_{userId}_{groupId}";
         if (_cache.TryGetValue(cacheKey, out bool isMember))
+        {
+            _logger.LogDebug("Group membership cache hit for user {UserId}, group {GroupId}", userId, groupId);
             return isMember;
+        }
 
         try
         {
@@ -2276,8 +2423,11 @@ public class UserAuthorizationService : IUserAuthorizationService
 
             isMember = result?.Value?.Contains(groupId) ?? false;
 
-            // Cache result
-            _cache.Set(cacheKey, isMember, TimeSpan.FromMinutes(5));
+            // Cache result using configured TTL
+            var cacheDuration = TimeSpan.FromMinutes(_authOptions.CacheGroupMembershipMinutes);
+            _cache.Set(cacheKey, isMember, cacheDuration);
+            
+            _logger.LogInformation("Cached group membership for user {UserId}, group {GroupId}: {IsMember}", userId, groupId, isMember);
 
             return isMember;
         }
@@ -3147,7 +3297,190 @@ jobs:
 
 ## 14. Development Guidelines
 
-### 14.1 Local Development Workflow
+### 14.1 Configuration Best Practices - IOptions Pattern
+
+**CRITICAL**: Always use IOptions pattern for accessing configuration. Never inject `IConfiguration` directly into services.
+
+#### Why Use IOptions Pattern?
+
+| Benefit | Description |
+|---------|-------------|
+| **Type Safety** | Compile-time checking, IntelliSense support |
+| **Testability** | Easy to mock and test with different values |
+| **Validation** | Built-in validation with Data Annotations |
+| **Separation of Concerns** | Configuration is a dependency, not implementation detail |
+| **Refactoring Safe** | Renaming properties shows errors at compile time |
+| **Performance** | Options are singleton by default, computed once |
+
+#### Anti-Pattern ❌ (Don't Do This)
+
+```csharp
+// BAD: Direct configuration access
+public class MyService
+{
+    private readonly IConfiguration _configuration;
+    
+    public MyService(IConfiguration configuration)
+    {
+        _configuration = configuration;
+    }
+    
+    public void DoSomething()
+    {
+        var groupId = _configuration["Authorization:AdminGroupId"];  // ❌ String-based, error-prone
+        var timeout = int.Parse(_configuration["Cache:ExpirationMinutes"]);  // ❌ Manual parsing
+    }
+}
+```
+
+#### Recommended Pattern ✅ (Do This)
+
+```csharp
+// GOOD: IOptions pattern
+public class MyService
+{
+    private readonly AuthorizationOptions _authOptions;
+    private readonly CacheOptions _cacheOptions;
+    
+    public MyService(
+        IOptions<AuthorizationOptions> authOptions,
+        IOptions<CacheOptions> cacheOptions)
+    {
+        _authOptions = authOptions.Value;
+        _cacheOptions = cacheOptions.Value;
+    }
+    
+    public void DoSomething()
+    {
+        var groupId = _authOptions.AdminGroupId;  // ✅ Strongly-typed, IntelliSense works
+        var timeout = _cacheOptions.ExpirationMinutes;  // ✅ Already parsed, validated
+    }
+}
+```
+
+#### IOptions vs IOptionsSnapshot vs IOptionsMonitor
+
+| Type | Lifetime | Use Case | Reloads Config? |
+|------|----------|----------|-----------------|
+| `IOptions<T>` | Singleton | Configuration doesn't change at runtime | ❌ No |
+| `IOptionsSnapshot<T>` | Scoped | Configuration may change between requests | ✅ Yes (per request) |
+| `IOptionsMonitor<T>` | Singleton | Need real-time config changes | ✅ Yes (immediately) |
+
+**For this project**: Use `IOptions<T>` (configuration is set at startup)
+
+#### Adding Validation
+
+```csharp
+// Add Data Annotations to Options classes
+public class AuthorizationOptions
+{
+    public const string SectionName = "Authorization";
+    
+    [Required(ErrorMessage = "AdminGroupId is required")]
+    [MinLength(36, ErrorMessage = "AdminGroupId must be a valid GUID")]
+    public string AdminGroupId { get; set; } = string.Empty;
+    
+    [Required(ErrorMessage = "SupportGroupId is required")]
+    [MinLength(36, ErrorMessage = "SupportGroupId must be a valid GUID")]
+    public string SupportGroupId { get; set; } = string.Empty;
+    
+    [Range(1, 60, ErrorMessage = "Cache minutes must be between 1 and 60")]
+    public int CacheGroupMembershipMinutes { get; set; } = 5;
+}
+
+// Register with validation in Program.cs
+builder.Services.AddOptions<AuthorizationOptions>()
+    .Bind(builder.Configuration.GetSection(AuthorizationOptions.SectionName))
+    .ValidateDataAnnotations()  // Validates data annotations
+    .ValidateOnStart();  // Validates at startup (fail fast!)
+```
+
+#### Custom Validation
+
+```csharp
+// Custom validation logic
+builder.Services.AddOptions<AuthorizationOptions>()
+    .Bind(builder.Configuration.GetSection(AuthorizationOptions.SectionName))
+    .Validate(options =>
+    {
+        // Custom validation logic
+        if (options.AdminGroupId == options.SupportGroupId)
+        {
+            return false;  // Admin and Support groups must be different
+        }
+        return true;
+    }, "Admin and Support group IDs must be different")
+    .ValidateOnStart();
+```
+
+#### Testing with IOptions
+
+```csharp
+// Unit test example
+[Fact]
+public async Task IsAdministratorAsync_ReturnsTrue_WhenUserInAdminGroup()
+{
+    // Arrange
+    var authOptions = Options.Create(new AuthorizationOptions
+    {
+        AdminGroupId = "test-admin-group-id",
+        SupportGroupId = "test-support-group-id"
+    });
+    
+    var service = new UserAuthorizationService(
+        mockGraphClient,
+        mockHttpContextAccessor,
+        authOptions,  // Easy to mock!
+        mockCache,
+        mockLogger);
+    
+    // Act
+    var result = await service.IsAdministratorAsync();
+    
+    // Assert
+    Assert.True(result);
+}
+```
+
+#### Accessing Configuration in Razor Components
+
+```razor
+@inject IOptions<FeaturesOptions> FeaturesOptions
+
+@code {
+    private FeaturesOptions _features = default!;
+    
+    protected override void OnInitialized()
+    {
+        _features = FeaturesOptions.Value;
+    }
+    
+    private void HandleDelete()
+    {
+        if (_features.EnableDelete)  // ✅ Type-safe configuration access
+        {
+            // Delete logic
+        }
+    }
+}
+```
+
+#### Configuration Checklist
+
+When adding new configuration:
+
+- [ ] Create strongly-typed Options class in `Models/Options/`
+- [ ] Add const string `SectionName` to Options class
+- [ ] Add default values where appropriate
+- [ ] Add Data Annotations for validation
+- [ ] Register with `builder.Services.Configure<T>()` in Program.cs
+- [ ] Add `ValidateDataAnnotations()` and `ValidateOnStart()`
+- [ ] Inject `IOptions<T>` into services (not `IConfiguration`)
+- [ ] Update appsettings.json with example values
+- [ ] Document in this requirements file
+- [ ] Add unit tests with mocked IOptions
+
+### 14.2 Local Development Workflow
 
 **First-Time Setup (One-time):**
 
@@ -3232,17 +3565,31 @@ az account show  # If expired, run: az login
 
 ### 14.4 Code Review Checklist
 
+**General:**
 - [ ] Code follows style guidelines
 - [ ] Unit tests added/updated
 - [ ] **No hardcoded secrets or credentials**
 - [ ] **No secrets in appsettings.json or appsettings.Development.json**
 - [ ] Error handling implemented
 - [ ] Logging added for important operations
-- [ ] XML comments added
+- [ ] XML comments added for public APIs
 - [ ] No console warnings or errors
-- [ ] Configuration works both locally and in Azure (test DefaultAzureCredential)
+
+**Configuration:**
+- [ ] **Uses IOptions pattern (not IConfiguration directly)**
+- [ ] Configuration accessed through strongly-typed Options classes
+- [ ] Options classes have Data Annotations for validation
+- [ ] Options registered with `ValidateOnStart()` in Program.cs
+- [ ] No string-based configuration access (e.g., `_configuration["Key"]`)
+- [ ] Configuration works both locally and in Azure
 - [ ] User Secrets used for local sensitive data
 - [ ] .gitignore properly excludes secrets
+
+**Security:**
+- [ ] No exposure of sensitive data in logs
+- [ ] Proper authorization checks (IOptions<AuthorizationOptions>)
+- [ ] DefaultAzureCredential used correctly
+- [ ] No personal admin permissions required for developers
 
 ### 14.5 Performance Considerations
 
@@ -3974,9 +4321,10 @@ foreach ($permission in $permissions) {
 
 ---
 
-**Document Version**: 2.3 (User-Assigned MI + Development Service Principal)  
+**Document Version**: 2.4 (User-Assigned MI + Development SP + IOptions Pattern)  
 **Last Updated**: November 22, 2025  
 **Status**: Ready for Development  
 **Security Model**: Zero-Secrets Architecture with User-Assigned Managed Identity  
 **Developer Experience**: Development Service Principal provides production-like permissions locally - Set credentials in User Secrets and F5!  
+**Configuration Pattern**: IOptions pattern for type-safe, testable, validated configuration  
 **Key Innovation**: Developers don't need admin permissions - Use shared Development SP with MI-like permissions
