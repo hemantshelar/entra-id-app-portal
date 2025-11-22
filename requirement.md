@@ -8,12 +8,27 @@ Build a modern web portal to manage and monitor Azure Entra ID (formerly Azure A
 
 ### 1.2 Goals
 
+- Provide a secure, authenticated web portal for authorized users only
+- **Use Managed Identity for all Azure resource access (zero secrets in production)**
 - Provide a user-friendly interface to view and manage Entra ID app registrations
 - Enable proactive monitoring of expiring secrets and certificates
 - Reduce Microsoft Graph API calls through intelligent caching
+- Implement group-based authorization using Entra ID security groups
 - Deploy to Azure cloud with scalability and security best practices
 
-### 1.3 Target Audience
+### 1.3 Security-First Design Principle
+
+**🔐 ZERO SECRETS ARCHITECTURE**: This application follows a zero-secrets architecture using Azure Managed Identity and DefaultAzureCredential:
+
+- ✅ **NO** client secrets stored in configuration files
+- ✅ **NO** connection strings with credentials
+- ✅ **NO** API keys in code or environment variables
+- ✅ All Azure resources accessed via **Managed Identity**
+- ✅ All credentials managed automatically by Azure
+- ✅ Developers use their own credentials locally (Azure CLI, VS Code)
+- ✅ Production uses System-Assigned Managed Identity
+
+### 1.4 Target Audience
 
 - IT Administrators
 - DevOps Engineers
@@ -41,6 +56,8 @@ Build a modern web portal to manage and monitor Azure Entra ID (formerly Azure A
 - **Web API**: ASP.NET Core Minimal API or Web API
 - **Authentication**: Microsoft Identity Platform (Entra ID)
 - **Graph API Client**: Microsoft.Graph SDK (latest)
+- **Azure Authentication**: Azure.Identity SDK with DefaultAzureCredential
+- **Managed Identity**: System-assigned or User-assigned Managed Identity for Azure resources
 - **Caching**: IMemoryCache or IDistributedCache (Redis for production)
 
 ### 2.4 Architecture Patterns
@@ -54,8 +71,10 @@ Build a modern web portal to manage and monitor Azure Entra ID (formerly Azure A
 ### 2.5 Cloud & DevOps
 
 - **Hosting**: Azure App Service or Azure Container Apps
-- **Configuration**: Azure Key Vault for secrets
-- **Monitoring**: Application Insights
+- **Identity**: Managed Identity (System-assigned preferred)
+- **Configuration**: Azure Key Vault accessed via Managed Identity (no secrets in code)
+- **Monitoring**: Application Insights (connected via Managed Identity)
+- **Resource Access**: DefaultAzureCredential for all Azure services
 - **CI/CD**: GitHub Actions or Azure DevOps
 
 ---
@@ -373,7 +392,9 @@ entra-id-app-portal/
 │   │   ├── IGraphService.cs
 │   │   ├── GraphService.cs               # Graph API calls
 │   │   ├── ICacheService.cs
-│   │   └── CacheService.cs               # Cache management
+│   │   ├── CacheService.cs               # Cache management
+│   │   ├── IUserAuthorizationService.cs  # Group-based authorization
+│   │   └── UserAuthorizationService.cs   # Check user group membership
 │   ├── Models/
 │   │   ├── AppRegistrationDto.cs
 │   │   └── FilterOptions.cs
@@ -517,15 +538,33 @@ public class DeleteResponse
     "Instance": "https://login.microsoftonline.com/",
     "TenantId": "<tenant-id>",
     "ClientId": "<client-id>",
-    "ClientSecret": "<client-secret>", // Vault or secrets.json only
+    "ClientSecret": "<client-secret>", // ONLY for local development (User Secrets)
     "CallbackPath": "/signin-oidc",
-    "Scopes": "https://graph.microsoft.com/.default"
+    "SignedOutCallbackPath": "/signout-callback-oidc"
+  },
+  "ManagedIdentity": {
+    "Enabled": true, // Set to true in Azure, false for local development
+    "ClientId": "<user-assigned-mi-client-id>", // Optional: For user-assigned MI
+    "UseManagedIdentityForGraph": true // Use Managed Identity for Graph API calls
+  },
+  "Authorization": {
+    "AdminGroupId": "<Entra-Admin-Group-Object-Id>",
+    "AdminGroupName": "Entra-Admin",
+    "SupportGroupId": "<Entra-Support-Group-Object-Id>",
+    "SupportGroupName": "Entra-Support",
+    "RequireGroupMembership": true,
+    "CacheGroupMembershipMinutes": 5
   },
   "GraphApi": {
     "BaseUrl": "https://graph.microsoft.com/v1.0",
+    "Scopes": ["https://graph.microsoft.com/.default"],
     "BatchSize": 999,
     "RetryAttempts": 3,
     "RetryDelaySeconds": 2
+  },
+  "KeyVault": {
+    "VaultUri": "https://<your-keyvault-name>.vault.azure.net/",
+    "UseManagedIdentity": true
   },
   "Cache": {
     "ExpirationMinutes": 60,
@@ -535,11 +574,16 @@ public class DeleteResponse
   "Features": {
     "EnableDelete": true,
     "EnableExport": true,
-    "EnableBulkOperations": false
+    "EnableBulkOperations": false,
+    "AllowSupportRefresh": false
+  },
+  "Session": {
+    "IdleTimeoutMinutes": 30,
+    "AbsoluteTimeoutHours": 8
   },
   "Monitoring": {
     "ApplicationInsights": {
-      "ConnectionString": "<connection-string>"
+      "ConnectionString": "" // Leave empty to use Managed Identity
     }
   }
 }
@@ -583,50 +627,995 @@ builder.Services.Configure<AzureAdOptions>(
     builder.Configuration.GetSection("AzureAd"));
 builder.Services.Configure<GraphApiOptions>(
     builder.Configuration.GetSection("GraphApi"));
+builder.Services.Configure<ManagedIdentityOptions>(
+    builder.Configuration.GetSection("ManagedIdentity"));
+```
+
+---
+
+## 6.4 Managed Identity & Azure Default Credential - Best Practices
+
+### Overview
+
+**CRITICAL SECURITY REQUIREMENT**: This application MUST use **Managed Identity** to access Azure resources and Microsoft Graph API. NO client secrets or certificates should be used in production.
+
+**Benefits**:
+
+- ✅ No secrets to manage or rotate
+- ✅ Automatic credential management by Azure
+- ✅ Enhanced security posture
+- ✅ Simplified deployment and operations
+- ✅ Audit trail of all resource access
+
+### 6.4.1 DefaultAzureCredential Chain
+
+Use `DefaultAzureCredential` from Azure.Identity SDK - it provides a credential chain that tries authentication methods in order:
+
+**Authentication Chain Order**:
+
+1. **EnvironmentCredential** - Reads account info from environment variables
+2. **WorkloadIdentityCredential** - Azure Kubernetes Service workload identity
+3. **ManagedIdentityCredential** - System or User-assigned Managed Identity (Azure resources)
+4. **SharedTokenCacheCredential** - Uses cached credentials from developer tools
+5. **VisualStudioCredential** - Uses signed-in Visual Studio account
+6. **VisualStudioCodeCredential** - Uses signed-in VS Code Azure account
+7. **AzureCliCredential** - Uses Azure CLI logged-in account
+8. **AzurePowerShellCredential** - Uses Azure PowerShell logged-in account
+9. **AzureDeveloperCliCredential** - Uses Azure Developer CLI (azd)
+10. **InteractiveBrowserCredential** - Opens browser for interactive login (disabled by default)
+
+**Result**: Developers use their own credentials locally (Azure CLI, VS Code), production uses Managed Identity automatically!
+
+### 6.4.2 Required NuGet Packages
+
+```xml
+<PackageReference Include="Azure.Identity" Version="1.13.*" />
+<PackageReference Include="Azure.Security.KeyVault.Secrets" Version="4.6.*" />
+<PackageReference Include="Azure.Extensions.AspNetCore.Configuration.Secrets" Version="1.3.*" />
+<PackageReference Include="Microsoft.Graph" Version="5.*" />
+<PackageReference Include="Microsoft.Identity.Web" Version="3.*" />
+<PackageReference Include="Microsoft.Identity.Web.MicrosoftGraph" Version="3.*" />
+<PackageReference Include="Microsoft.Identity.Web.TokenCache" Version="3.*" />
+```
+
+### 6.4.3 Configuration Setup with DefaultAzureCredential
+
+```csharp
+// Program.cs
+using Azure.Identity;
+using Azure.Security.KeyVault.Secrets;
+using Microsoft.Graph;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// Create DefaultAzureCredential instance
+// This will work both locally (using developer credentials) and in Azure (using Managed Identity)
+var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
+{
+    // Exclude credentials you don't want to use (optional)
+    ExcludeInteractiveBrowserCredential = true, // Don't open browser
+    ExcludeSharedTokenCacheCredential = true,   // Optional: exclude if not needed
+
+    // Specify User-Assigned Managed Identity (if using UAMI instead of SAMI)
+    ManagedIdentityClientId = builder.Configuration["ManagedIdentity:ClientId"],
+
+    // Enable logging for troubleshooting
+    Diagnostics =
+    {
+        LoggedHeaderNames = { "x-ms-request-id" },
+        LoggedQueryParameters = { "api-version" },
+        IsLoggingContentEnabled = true
+    }
+});
+
+// Register credential as singleton
+builder.Services.AddSingleton(credential);
+
+// 1. Load configuration from Azure Key Vault using Managed Identity
+var keyVaultUri = builder.Configuration["KeyVault:VaultUri"];
+if (!string.IsNullOrEmpty(keyVaultUri))
+{
+    builder.Configuration.AddAzureKeyVault(
+        new Uri(keyVaultUri),
+        credential); // Uses DefaultAzureCredential
+}
+
+// 2. Configure Application Insights with Managed Identity
+builder.Services.AddApplicationInsightsTelemetry(options =>
+{
+    // Connection string from Key Vault or config
+    options.ConnectionString = builder.Configuration["ApplicationInsights:ConnectionString"];
+});
+
+// 3. Configure Microsoft Graph with Managed Identity
+builder.Services.AddMicrosoftGraph(options =>
+{
+    options.Scopes = new[] { "https://graph.microsoft.com/.default" };
+})
+.ConfigurePrimaryHttpMessageHandler(() => new SocketsHttpHandler
+{
+    PooledConnectionLifetime = TimeSpan.FromMinutes(2)
+});
+
+// 4. Register Graph Service Client with Managed Identity
+builder.Services.AddSingleton<GraphServiceClient>(sp =>
+{
+    var useManagedIdentity = builder.Configuration.GetValue<bool>("ManagedIdentity:UseManagedIdentityForGraph");
+
+    if (useManagedIdentity)
+    {
+        // Production: Use Managed Identity
+        var graphCredential = credential;
+        return new GraphServiceClient(graphCredential,
+            new[] { "https://graph.microsoft.com/.default" });
+    }
+    else
+    {
+        // Development: Use delegated credentials (on behalf of user)
+        // This is configured separately via Microsoft.Identity.Web
+        var graphClient = sp.GetRequiredService<GraphServiceClient>();
+        return graphClient;
+    }
+});
+
+// 5. Configure Redis Cache with Managed Identity (if using Azure Cache for Redis)
+var redisConnectionString = builder.Configuration["Redis:ConnectionString"];
+if (!string.IsNullOrEmpty(redisConnectionString))
+{
+    builder.Services.AddStackExchangeRedisCache(options =>
+    {
+        options.Configuration = redisConnectionString;
+        // Azure Cache for Redis with Managed Identity requires Azure.Extensions.AspNetCore.Configuration.Secrets
+    });
+}
+
+// 6. Register Key Vault client for runtime secret access
+builder.Services.AddSingleton<SecretClient>(sp =>
+{
+    var vaultUri = builder.Configuration["KeyVault:VaultUri"];
+    return new SecretClient(new Uri(vaultUri), credential);
+});
+```
+
+### 6.4.4 Graph API Service Implementation with Managed Identity
+
+```csharp
+// Services/GraphService.cs
+using Azure.Identity;
+using Microsoft.Graph;
+using Microsoft.Graph.Models;
+
+public interface IGraphService
+{
+    Task<IEnumerable<Application>> GetApplicationsAsync(int top = 999);
+    Task<IEnumerable<string>> GetUserGroupsAsync(string userId);
+    Task DeleteApplicationAsync(string applicationId);
+}
+
+public class GraphService : IGraphService
+{
+    private readonly GraphServiceClient _graphClient;
+    private readonly ILogger<GraphService> _logger;
+    private readonly IConfiguration _configuration;
+
+    public GraphService(
+        TokenCredential credential, // DefaultAzureCredential injected
+        IConfiguration configuration,
+        ILogger<GraphService> logger)
+    {
+        _configuration = configuration;
+        _logger = logger;
+
+        // Create Graph client with Managed Identity
+        _graphClient = new GraphServiceClient(
+            credential,
+            new[] { "https://graph.microsoft.com/.default" });
+    }
+
+    public async Task<IEnumerable<Application>> GetApplicationsAsync(int top = 999)
+    {
+        try
+        {
+            var applications = new List<Application>();
+
+            // Get applications with batching
+            var response = await _graphClient.Applications
+                .GetAsync(requestConfiguration =>
+                {
+                    requestConfiguration.QueryParameters.Top = top;
+                    requestConfiguration.QueryParameters.Select = new[]
+                    {
+                        "id", "appId", "displayName", "createdDateTime",
+                        "passwordCredentials", "keyCredentials"
+                    };
+                    requestConfiguration.QueryParameters.Orderby = new[] { "displayName" };
+                });
+
+            if (response?.Value != null)
+            {
+                applications.AddRange(response.Value);
+
+                // Handle pagination
+                var pageIterator = PageIterator<Application, ApplicationCollectionResponse>
+                    .CreatePageIterator(
+                        _graphClient,
+                        response,
+                        app =>
+                        {
+                            applications.Add(app);
+                            return true; // Continue iterating
+                        });
+
+                await pageIterator.IterateAsync();
+            }
+
+            _logger.LogInformation("Retrieved {Count} applications from Graph API", applications.Count);
+            return applications;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retrieve applications from Graph API");
+            throw;
+        }
+    }
+
+    public async Task<IEnumerable<string>> GetUserGroupsAsync(string userId)
+    {
+        try
+        {
+            var groups = new List<string>();
+
+            var response = await _graphClient.Users[userId]
+                .MemberOf
+                .GraphGroup
+                .GetAsync();
+
+            if (response?.Value != null)
+            {
+                groups.AddRange(response.Value.Select(g => g.Id ?? string.Empty));
+            }
+
+            return groups;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retrieve user groups for {UserId}", userId);
+            throw;
+        }
+    }
+
+    public async Task DeleteApplicationAsync(string applicationId)
+    {
+        try
+        {
+            await _graphClient.Applications[applicationId].DeleteAsync();
+            _logger.LogInformation("Deleted application {ApplicationId}", applicationId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to delete application {ApplicationId}", applicationId);
+            throw;
+        }
+    }
+}
+```
+
+### 6.4.5 Key Vault Access Pattern
+
+```csharp
+// Services/SecretService.cs
+using Azure.Security.KeyVault.Secrets;
+using Azure.Identity;
+
+public interface ISecretService
+{
+    Task<string> GetSecretAsync(string secretName);
+}
+
+public class SecretService : ISecretService
+{
+    private readonly SecretClient _secretClient;
+    private readonly ILogger<SecretService> _logger;
+
+    public SecretService(
+        TokenCredential credential, // DefaultAzureCredential injected
+        IConfiguration configuration,
+        ILogger<SecretService> logger)
+    {
+        _logger = logger;
+        var vaultUri = configuration["KeyVault:VaultUri"];
+
+        _secretClient = new SecretClient(
+            new Uri(vaultUri!),
+            credential); // Uses Managed Identity in Azure, developer creds locally
+    }
+
+    public async Task<string> GetSecretAsync(string secretName)
+    {
+        try
+        {
+            KeyVaultSecret secret = await _secretClient.GetSecretAsync(secretName);
+            _logger.LogInformation("Retrieved secret {SecretName} from Key Vault", secretName);
+            return secret.Value;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to retrieve secret {SecretName} from Key Vault", secretName);
+            throw;
+        }
+    }
+}
+```
+
+### 6.4.6 Local Development Setup
+
+**Prerequisites for local development** (DefaultAzureCredential will use these):
+
+**Option 1: Azure CLI (Recommended)**
+
+```bash
+# Login to Azure
+az login
+
+# Set default subscription (if you have multiple)
+az account set --subscription "<subscription-id>"
+
+# Verify login
+az account show
+
+# Your app will now use these credentials locally
+```
+
+**Option 2: Visual Studio Code**
+
+```bash
+# Install Azure Account extension
+# Sign in via Command Palette: "Azure: Sign In"
+```
+
+**Option 3: Visual Studio**
+
+- Tools → Options → Azure Service Authentication
+- Sign in with your Azure account
+
+**Option 4: Environment Variables (for CI/CD or testing)**
+
+```bash
+# Set environment variables
+export AZURE_CLIENT_ID="<app-registration-client-id>"
+export AZURE_CLIENT_SECRET="<client-secret>"
+export AZURE_TENANT_ID="<tenant-id>"
+```
+
+### 6.4.7 Azure Managed Identity Setup
+
+#### Step 1: Enable System-Assigned Managed Identity
+
+**Azure App Service:**
+
+```bash
+# Enable system-assigned managed identity
+az webapp identity assign \
+    --name <app-name> \
+    --resource-group <resource-group-name>
+
+# Output will include principalId (Object ID of the managed identity)
+```
+
+**Azure Portal:**
+
+1. Navigate to App Service → Identity
+2. System assigned → Status: On
+3. Click Save
+4. Copy Object (principal) ID
+
+#### Step 2: Grant Managed Identity Access to Key Vault
+
+```bash
+# Grant Key Vault access
+az keyvault set-policy \
+    --name <key-vault-name> \
+    --object-id <managed-identity-principal-id> \
+    --secret-permissions get list
+
+# For Certificate access (if needed)
+az keyvault set-policy \
+    --name <key-vault-name> \
+    --object-id <managed-identity-principal-id> \
+    --certificate-permissions get list
+```
+
+**Or using Azure RBAC (Recommended):**
+
+```bash
+# Assign Key Vault Secrets User role
+az role assignment create \
+    --role "Key Vault Secrets User" \
+    --assignee <managed-identity-principal-id> \
+    --scope /subscriptions/<subscription-id>/resourceGroups/<rg-name>/providers/Microsoft.KeyVault/vaults/<kv-name>
+```
+
+#### Step 3: Grant Managed Identity Access to Microsoft Graph
+
+**CRITICAL**: Managed Identity needs Graph API permissions to call Graph on behalf of the application.
+
+```powershell
+# Connect to Microsoft Graph with admin privileges
+Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All"
+
+# Get the Managed Identity Service Principal
+$managedIdentityObjectId = "<managed-identity-principal-id>"
+$sp = Get-MgServicePrincipal -ServicePrincipalId $managedIdentityObjectId
+
+# Get Microsoft Graph Service Principal
+$graphSp = Get-MgServicePrincipal -Filter "displayName eq 'Microsoft Graph'"
+
+# Define required Graph API permissions (Application permissions, not delegated)
+$permissions = @(
+    "Application.Read.All",        # Or Application.ReadWrite.All for delete
+    "Directory.Read.All",
+    "GroupMember.Read.All"
+)
+
+# Assign permissions
+foreach ($permission in $permissions) {
+    $appRole = $graphSp.AppRoles | Where-Object { $_.Value -eq $permission }
+
+    if ($appRole) {
+        New-MgServicePrincipalAppRoleAssignment `
+            -ServicePrincipalId $managedIdentityObjectId `
+            -PrincipalId $managedIdentityObjectId `
+            -ResourceId $graphSp.Id `
+            -AppRoleId $appRole.Id
+
+        Write-Host "Granted $permission to Managed Identity"
+    }
+}
+```
+
+**Alternative using Azure CLI:**
+
+```bash
+# This is more complex - PowerShell method above is recommended
+# But here's the approach:
+
+# Get Graph API service principal ID
+GRAPH_SP_ID=$(az ad sp list --display-name "Microsoft Graph" --query "[0].id" -o tsv)
+
+# Get the app role ID for Application.Read.All
+APP_ROLE_ID=$(az ad sp show --id $GRAPH_SP_ID --query "appRoles[?value=='Application.Read.All'].id" -o tsv)
+
+# Assign the role
+az rest --method POST \
+    --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$MANAGED_IDENTITY_OBJECT_ID/appRoleAssignments" \
+    --body "{'principalId':'$MANAGED_IDENTITY_OBJECT_ID','resourceId':'$GRAPH_SP_ID','appRoleId':'$APP_ROLE_ID'}"
+```
+
+#### Step 4: Grant Access to Other Azure Resources
+
+**Application Insights:**
+
+```bash
+# Assign Monitoring Metrics Publisher role
+az role assignment create \
+    --role "Monitoring Metrics Publisher" \
+    --assignee <managed-identity-principal-id> \
+    --scope /subscriptions/<subscription-id>/resourceGroups/<rg-name>/providers/Microsoft.Insights/components/<app-insights-name>
+```
+
+**Azure Cache for Redis:**
+
+```bash
+# Assign Redis Cache Contributor role
+az role assignment create \
+    --role "Redis Cache Contributor" \
+    --assignee <managed-identity-principal-id> \
+    --scope /subscriptions/<subscription-id>/resourceGroups/<rg-name>/providers/Microsoft.Cache/Redis/<redis-name>
+```
+
+### 6.4.8 Troubleshooting DefaultAzureCredential
+
+**Enable Detailed Logging:**
+
+```csharp
+// Program.cs
+using Azure.Core.Diagnostics;
+
+// Enable Azure SDK logging
+using AzureEventSourceListener listener = AzureEventSourceListener.CreateConsoleLogger(EventLevel.Verbose);
+
+// Or log to file
+using AzureEventSourceListener listener = AzureEventSourceListener.CreateTraceLogger(EventLevel.Verbose);
+```
+
+**Common Issues:**
+
+1. **Local Development: "DefaultAzureCredential failed to retrieve a token"**
+
+   - Solution: Run `az login` or sign in to Visual Studio/VS Code
+   - Verify: `az account show`
+
+2. **Azure: "ManagedIdentityCredential authentication failed"**
+
+   - Verify Managed Identity is enabled: Check App Service → Identity
+   - Verify permissions: Check Key Vault access policies or RBAC assignments
+   - Check Graph API permissions: Ensure app roles are assigned
+
+3. **"AADSTS700016: Application not found in the directory"**
+
+   - Managed Identity principal not granted Graph API permissions
+   - Follow Step 3 above to grant permissions
+
+4. **Key Vault Access Denied**
+   - Verify: `az keyvault secret show --name <secret-name> --vault-name <vault-name>`
+   - Grant access: Follow Step 2 above
+
+**Diagnostic Code:**
+
+```csharp
+// Services/DiagnosticService.cs
+public async Task TestDefaultAzureCredential()
+{
+    try
+    {
+        var credential = new DefaultAzureCredential();
+
+        // Try to acquire token for Graph API
+        var tokenContext = new TokenRequestContext(
+            new[] { "https://graph.microsoft.com/.default" });
+
+        var token = await credential.GetTokenAsync(tokenContext);
+
+        _logger.LogInformation("Successfully acquired token. Expires: {ExpiresOn}",
+            token.ExpiresOn);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex, "Failed to acquire token with DefaultAzureCredential");
+    }
+}
+```
+
+### 6.4.9 Best Practices Summary
+
+✅ **DO**:
+
+- Use `DefaultAzureCredential` for all Azure resource access
+- Enable System-Assigned Managed Identity in production
+- Use Azure CLI login for local development
+- Log credential acquisition for troubleshooting
+- Use RBAC over access policies when possible
+- Rotate any development secrets regularly
+- Test with Managed Identity in staging environment first
+
+❌ **DON'T**:
+
+- Don't store client secrets in code or appsettings.json (production)
+- Don't use client secrets in production (use Managed Identity)
+- Don't hardcode tenant IDs or client IDs in code
+- Don't expose Managed Identity Object IDs in client-side code
+- Don't grant excessive permissions (principle of least privilege)
+- Don't skip testing Managed Identity before production deployment
+
+### 6.4.10 Environment-Specific Configuration
+
+**Development (appsettings.Development.json or User Secrets):**
+
+```json
+{
+  "ManagedIdentity": {
+    "Enabled": false,
+    "UseManagedIdentityForGraph": false
+  },
+  "AzureAd": {
+    "ClientSecret": "<dev-client-secret>"
+  }
+}
+```
+
+**Production (Azure App Configuration or Key Vault):**
+
+```json
+{
+  "ManagedIdentity": {
+    "Enabled": true,
+    "UseManagedIdentityForGraph": true
+  },
+  "AzureAd": {
+    "ClientSecret": "" // Not used in production
+  }
+}
 ```
 
 ---
 
 ## 7. Authentication & Authorization
 
-### 7.1 Authentication Flow
+### 7.1 Authentication Requirements
 
-- Use Microsoft Identity Platform (MSAL)
-- Implement OAuth 2.0 authorization code flow
-- Acquire tokens for Microsoft Graph API
-- Support for token refresh
+**CRITICAL**: The portal MUST require authentication. No features or pages should be accessible to unauthenticated users.
 
-### 7.2 Required App Registration Permissions
+**Authentication Flow**:
 
-**Microsoft Graph API Permissions** (Application type):
+- Use Microsoft Identity Platform (Microsoft.Identity.Web)
+- Implement **OAuth 2.0 Authorization Code Flow with PKCE** (Proof Key for Code Exchange)
+- Redirect unauthenticated users to Microsoft login page
+- Acquire access tokens for Microsoft Graph API
+- Support automatic token refresh
+- Implement proper logout functionality
 
-- `Application.Read.All` (minimum for read operations)
-- `Application.ReadWrite.All` (required for delete operations)
-- `Directory.Read.All` (for owner information)
+**User Experience**:
 
-**Delegated Permissions** (if using delegated auth):
+- Landing page redirects immediately to login if not authenticated
+- Display user name and email in header after authentication
+- Provide logout button in navigation bar
+- Show "Access Denied" page for authenticated users without proper group membership
 
-- `User.Read`
-- `Application.Read.All`
+### 7.2 Group-Based Authorization
 
-### 7.3 Authorization Roles
+**Entra ID Security Groups**: Authorization is based on Entra ID group membership, not individual role assignments.
 
-| Role              | Permissions                                |
-| ----------------- | ------------------------------------------ |
-| **Reader**        | View all app registrations, filter, export |
-| **Contributor**   | Reader + Refresh cache                     |
-| **Administrator** | Contributor + Delete app registrations     |
+| Entra ID Group    | Role          | Access Level              | Permissions                                                                                                                                                |
+| ----------------- | ------------- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Entra-Admin**   | Administrator | Full Access (Super Users) | - View all app registrations<br>- Apply all filters<br>- Export data<br>- Refresh cache<br>- **Delete app registrations**<br>- Access all features         |
+| **Entra-Support** | Reader        | Read-Only Access          | - View all app registrations<br>- Apply all filters<br>- Export data<br>- **NO** delete permissions<br>- **NO** refresh permissions (optional restriction) |
 
-Implementation:
+**Access Control Rules**:
+
+1. User MUST be authenticated to access any portal feature
+2. User MUST be a member of at least one authorized group (Entra-Admin OR Entra-Support)
+3. Users not in either group see "Access Denied" message
+4. Group membership is checked on every request (cached for performance)
+5. Delete operations require "Entra-Admin" group membership
+
+### 7.3 Required App Registration Configuration
+
+**App Registration Setup** (Azure Portal):
+
+1. Create new App Registration in Entra ID
+2. Configure **Authentication**:
+
+   - Platform: Web
+   - Redirect URI: `https://<your-app-url>/signin-oidc`
+   - Logout URL: `https://<your-app-url>/signout-callback-oidc`
+   - Enable ID tokens and access tokens
+   - Supported account types: Single tenant
+
+3. Configure **API Permissions** (Delegated):
+
+   - `User.Read` - Sign in and read user profile
+   - `Application.Read.All` - Read all applications (or Application.ReadWrite.All for delete)
+   - `Directory.Read.All` - Read directory data
+   - `GroupMember.Read.All` - Read group memberships for the signed-in user
+
+4. **Optional - Application Permissions** (if using app-only flow for background jobs):
+
+   - `Application.Read.All` or `Application.ReadWrite.All`
+   - `Directory.Read.All`
+
+5. **Token Configuration**:
+
+   - Add optional claim: `groups` (emit security groups in token)
+   - OR configure group claims to return security groups
+   - Alternative: Use `GroupMember.Read.All` to query groups via API
+
+6. **Certificates & Secrets**:
+   - Create client secret (store in Key Vault)
+   - OR use certificate-based authentication (recommended for production)
+
+### 7.4 Authorization Implementation
+
+#### Option A: Groups in Token (Recommended for < 200 groups)
+
+Configure app registration to include groups in token claims:
 
 ```csharp
-[Authorize(Roles = "Administrator")]
-[HttpDelete("{id}")]
-public async Task<IActionResult> DeleteAppRegistration(string id)
+// Program.cs
+builder.Services.AddAuthentication(OpenIdConnectDefaults.AuthenticationScheme)
+    .AddMicrosoftIdentityWebApp(builder.Configuration.GetSection("AzureAd"))
+    .EnableTokenAcquisitionToCallDownstreamApi()
+    .AddMicrosoftGraph(builder.Configuration.GetSection("GraphApi"))
+    .AddInMemoryTokenCaches();
+
+builder.Services.AddAuthorization(options =>
 {
-    // Delete logic
+    // Require authentication for all pages
+    options.FallbackPolicy = new AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser()
+        .Build();
+
+    // Policy for Admin operations (Entra-Admin group)
+    options.AddPolicy("AdminOnly", policy =>
+        policy.RequireClaim("groups", "<Entra-Admin-Group-ObjectId>"));
+
+    // Policy for any authorized user (Admin OR Support)
+    options.AddPolicy("AuthorizedUser", policy =>
+        policy.RequireAssertion(context =>
+            context.User.HasClaim(c => c.Type == "groups" &&
+                (c.Value == "<Entra-Admin-Group-ObjectId>" ||
+                 c.Value == "<Entra-Support-Group-ObjectId>"))));
+});
+
+// Apply authorization globally
+builder.Services.AddRazorPages()
+    .AddMicrosoftIdentityUI();
+
+builder.Services.AddControllers(options =>
+{
+    // Require authenticated user for all API endpoints
+    var policy = new AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser()
+        .Build();
+    options.Filters.Add(new AuthorizeFilter(policy));
+});
+```
+
+#### Option B: Query Groups via Graph API (Recommended for many groups)
+
+```csharp
+// Services/IUserAuthorizationService.cs
+public interface IUserAuthorizationService
+{
+    Task<bool> IsUserInGroupAsync(string groupName);
+    Task<bool> IsAdministratorAsync();
+    Task<bool> IsAuthorizedUserAsync();
+    Task<UserRole> GetUserRoleAsync();
+}
+
+// Services/UserAuthorizationService.cs
+public class UserAuthorizationService : IUserAuthorizationService
+{
+    private readonly GraphServiceClient _graphClient;
+    private readonly IHttpContextAccessor _httpContextAccessor;
+    private readonly IConfiguration _configuration;
+    private readonly IMemoryCache _cache;
+
+    public async Task<bool> IsAdministratorAsync()
+    {
+        var adminGroupId = _configuration["Authorization:AdminGroupId"];
+        return await IsUserInGroupAsync(adminGroupId);
+    }
+
+    public async Task<bool> IsAuthorizedUserAsync()
+    {
+        var adminGroupId = _configuration["Authorization:AdminGroupId"];
+        var supportGroupId = _configuration["Authorization:SupportGroupId"];
+
+        return await IsUserInGroupAsync(adminGroupId) ||
+               await IsUserInGroupAsync(supportGroupId);
+    }
+
+    private async Task<bool> IsUserInGroupAsync(string groupId)
+    {
+        var userId = _httpContextAccessor.HttpContext?.User
+            .FindFirst("http://schemas.microsoft.com/identity/claims/objectidentifier")?.Value;
+
+        if (string.IsNullOrEmpty(userId)) return false;
+
+        // Check cache first (5 minute TTL)
+        var cacheKey = $"UserGroup_{userId}_{groupId}";
+        if (_cache.TryGetValue(cacheKey, out bool isMember))
+            return isMember;
+
+        try
+        {
+            // Check group membership via Graph API
+            var result = await _graphClient.Users[userId]
+                .CheckMemberGroups
+                .PostAsync(new CheckMemberGroupsPostRequestBody
+                {
+                    GroupIds = new List<string> { groupId }
+                });
+
+            isMember = result?.Value?.Contains(groupId) ?? false;
+
+            // Cache result
+            _cache.Set(cacheKey, isMember, TimeSpan.FromMinutes(5));
+
+            return isMember;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public async Task<UserRole> GetUserRoleAsync()
+    {
+        if (await IsAdministratorAsync())
+            return UserRole.Administrator;
+
+        if (await IsAuthorizedUserAsync())
+            return UserRole.Reader;
+
+        return UserRole.Unauthorized;
+    }
+}
+
+public enum UserRole
+{
+    Unauthorized,
+    Reader,
+    Administrator
 }
 ```
+
+#### Controller Authorization
+
+```csharp
+// Controllers/AppRegistrationsController.cs
+[Authorize] // Require authentication
+[ApiController]
+[Route("api/[controller]")]
+public class AppRegistrationsController : ControllerBase
+{
+    private readonly IUserAuthorizationService _authService;
+
+    [HttpGet]
+    public async Task<IActionResult> GetAll()
+    {
+        // Any authenticated user in authorized groups
+        if (!await _authService.IsAuthorizedUserAsync())
+            return Forbid();
+
+        // Return data
+    }
+
+    [HttpPost("refresh")]
+    public async Task<IActionResult> RefreshCache()
+    {
+        // Only admins can refresh (optional - or allow support too)
+        if (!await _authService.IsAdministratorAsync())
+            return Forbid();
+
+        // Refresh logic
+    }
+
+    [HttpDelete("{id}")]
+    public async Task<IActionResult> Delete(string id)
+    {
+        // Only admins can delete
+        if (!await _authService.IsAdministratorAsync())
+            return Forbid();
+
+        // Delete logic
+    }
+}
+```
+
+#### Blazor Component Authorization
+
+```razor
+@* Components/Pages/AppRegistrations.razor *@
+@page "/appregistrations"
+@attribute [Authorize] @* Require authentication *@
+@inject IUserAuthorizationService AuthService
+
+@if (!isAuthorized)
+{
+    <div class="alert alert-danger">
+        <h4>Access Denied</h4>
+        <p>You do not have permission to access this portal.</p>
+        <p>Please contact your administrator to be added to the Entra-Admin or Entra-Support group.</p>
+    </div>
+    return;
+}
+
+@* Show delete button only for admins *@
+@if (isAdmin)
+{
+    <button @onclick="DeleteApp" class="btn btn-danger">Delete</button>
+}
+
+@code {
+    private bool isAuthorized = false;
+    private bool isAdmin = false;
+
+    protected override async Task OnInitializedAsync()
+    {
+        isAuthorized = await AuthService.IsAuthorizedUserAsync();
+        isAdmin = await AuthService.IsAdministratorAsync();
+    }
+}
+```
+
+### 7.5 Configuration for Authorization
+
+Update configuration to include group IDs:
+
+```json
+{
+  "AzureAd": {
+    "Instance": "https://login.microsoftonline.com/",
+    "TenantId": "<tenant-id>",
+    "ClientId": "<client-id>",
+    "ClientSecret": "<client-secret>",
+    "CallbackPath": "/signin-oidc",
+    "SignedOutCallbackPath": "/signout-callback-oidc"
+  },
+  "Authorization": {
+    "AdminGroupId": "<Entra-Admin-Group-Object-Id>",
+    "AdminGroupName": "Entra-Admin",
+    "SupportGroupId": "<Entra-Support-Group-Object-Id>",
+    "SupportGroupName": "Entra-Support",
+    "RequireGroupMembership": true
+  },
+  "GraphApi": {
+    "BaseUrl": "https://graph.microsoft.com/v1.0",
+    "Scopes": ["User.Read", "Application.Read.All", "GroupMember.Read.All"]
+  }
+}
+```
+
+### 7.6 Login/Logout Flow
+
+**Login Flow**:
+
+1. User navigates to application URL
+2. Application detects unauthenticated user
+3. Redirect to Microsoft login page (OAuth2 authorization endpoint)
+4. User enters credentials and consents to permissions
+5. Microsoft redirects back with authorization code
+6. Application exchanges code for access token and ID token
+7. Application validates group membership
+8. If authorized, user gains access; otherwise, show "Access Denied"
+
+**Logout Flow**:
+
+1. User clicks logout button
+2. Clear local session and cookies
+3. Redirect to Microsoft logout endpoint
+4. Microsoft clears session and redirects back to application
+5. User sees login page
+
+**Implementation**:
+
+```csharp
+// Program.cs
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapGet("/", () => Results.Redirect("/appregistrations"))
+    .RequireAuthorization();
+
+app.MapGet("/access-denied", () =>
+    Results.Content(
+        "<h1>Access Denied</h1><p>You must be a member of Entra-Admin or Entra-Support group.</p>",
+        "text/html"))
+    .AllowAnonymous();
+```
+
+### 7.7 Security Considerations
+
+1. **Token Security**:
+
+   - Store tokens securely (encrypted cookies or distributed cache)
+   - Never expose tokens in client-side code
+   - Use HTTPS only (enforce in production)
+
+2. **Group Membership Caching**:
+
+   - Cache group checks to reduce Graph API calls
+   - Use short TTL (5 minutes) for cache
+   - Clear cache on logout
+
+3. **Session Management**:
+
+   - Implement sliding session expiration (20-30 minutes)
+   - Absolute session timeout (8 hours)
+   - Force re-authentication for sensitive operations (delete)
+
+4. **Audit Logging**:
+
+   - Log all authentication attempts (success/failure)
+   - Log authorization failures (unauthorized access attempts)
+   - Log group membership checks
+   - Log all delete operations with user context
+
+5. **Error Handling**:
+   - Never expose group IDs or internal details in error messages
+   - Provide user-friendly "Access Denied" messages
+   - Log detailed errors server-side for troubleshooting
 
 ---
 
@@ -714,14 +1703,52 @@ public async Task RefreshCacheAsync(IProgress<RefreshStatus> progress = null)
 
 ### 9.1 Layout
 
-- **Header**: App title, user info, logout button
+- **Header**:
+  - App title/logo (left)
+  - User info section (right):
+    - User display name
+    - User email (tooltip or dropdown)
+    - User role badge (Admin or Support)
+    - Logout button
+  - All header elements visible on all pages
 - **Navigation**: Side menu or top nav with sections:
   - Dashboard
   - All Applications
   - Expiring Secrets
   - Settings (future)
+  - Role-based menu items (show delete only for Admins)
 - **Main Content**: Data grid/table with filters panel
-- **Footer**: Copyright, version, last refresh time
+
+- **Footer**:
+  - Copyright
+  - Application version
+  - Last refresh time
+  - Environment indicator (Dev/Staging/Prod)
+
+### 9.1.1 Login/Logout Experience
+
+**Login Page** (if user is not authenticated):
+
+- Option 1: Auto-redirect to Microsoft login (recommended)
+- Option 2: Landing page with "Sign in with Microsoft" button
+- Clean, professional design
+- Show application logo and name
+- Brief description of portal purpose
+
+**Logout Confirmation** (optional):
+
+- Confirm logout action
+- Clear message about session ending
+- Redirect to login page or public landing
+
+**Access Denied Page** (authenticated but not in authorized group):
+
+- Clear "Access Denied" heading
+- Friendly message explaining the requirement
+- List required groups: "You must be a member of Entra-Admin or Entra-Support"
+- Contact information for requesting access
+- User details shown (so they know which account they're using)
+- Logout button available
 
 ### 9.2 App Registrations Page
 
@@ -912,10 +1939,33 @@ public async Task FilterByExpiring_Should_Return_Apps_Expiring_Within_Days()
 
 - Graph API integration (using test tenant)
 - Cache integration
-- Authentication flow
+- **Authentication flow (OAuth2 flow)**
+- **Authorization checks (group membership)**
 - API endpoints (end-to-end)
 
 **Framework**: WebApplicationFactory + xUnit
+
+**Authentication Testing Strategy**:
+
+- Use test users from development tenant
+- Create test accounts in both Entra-Admin and Entra-Support groups
+- Test unauthorized user (not in any group)
+- Mock Graph API responses for group membership
+- Test token expiration and refresh
+
+**Authorization Test Cases**:
+
+```csharp
+[Theory]
+[InlineData("admin-user", true)]  // Admin can delete
+[InlineData("support-user", false)]  // Support cannot delete
+public async Task Delete_Authorization_Tests(string userType, bool shouldSucceed)
+{
+    // Arrange: Set up authenticated user with specific group
+    // Act: Attempt delete operation
+    // Assert: Verify authorization outcome
+}
+```
 
 ### 11.3 BDD Tests (Optional)
 
@@ -953,13 +2003,15 @@ Feature: Application Registration Filtering
 
 ### 12.1 Azure Resources
 
-| Resource                 | Purpose                                | SKU/Tier                    |
-| ------------------------ | -------------------------------------- | --------------------------- |
-| Azure App Service        | Host web app and API                   | B1 (Basic) or S1 (Standard) |
-| Azure Key Vault          | Store secrets                          | Standard                    |
-| Azure Cache for Redis    | Distributed cache (optional)           | Basic C0                    |
-| Application Insights     | Monitoring and telemetry               | Pay-as-you-go               |
-| Azure Container Registry | Container images (if using containers) | Basic                       |
+| Resource                 | Purpose                                | SKU/Tier                    | Managed Identity Required |
+| ------------------------ | -------------------------------------- | --------------------------- | ------------------------- |
+| Azure App Service        | Host web app and API                   | B1 (Basic) or S1 (Standard) | ✅ **System-Assigned MI** |
+| Azure Key Vault          | Store secrets (NOT client secrets)     | Standard                    | ✅ Access granted to MI   |
+| Azure Cache for Redis    | Distributed cache (optional)           | Basic C0                    | ✅ Access granted to MI   |
+| Application Insights     | Monitoring and telemetry               | Pay-as-you-go               | ✅ Access granted to MI   |
+| Azure Container Registry | Container images (if using containers) | Basic                       | ✅ Access granted to MI   |
+
+**Managed Identity Setup**: All Azure resources must be accessed using the App Service's System-Assigned Managed Identity. No client secrets or connection strings should be stored in configuration.
 
 ### 12.2 Deployment Options
 
@@ -967,13 +2019,17 @@ Feature: Application Registration Filtering
 
 - Build and publish from CI/CD pipeline
 - Deploy as .NET application
-- Use App Service configuration for settings
+- **Enable System-Assigned Managed Identity**
+- Configure Key Vault access for Managed Identity
+- No secrets in deployment configuration
 
 **Option 2: Container-based (Preferred for Aspire)**
 
 - Build Docker images via Aspire
-- Push to Azure Container Registry
+- Push to Azure Container Registry (using MI for authentication)
 - Deploy to Azure Container Apps or AKS
+- **Container Apps automatically get Managed Identity**
+- Configure environment variables (no secrets)
 
 ### 12.3 CI/CD Pipeline
 
@@ -1022,19 +2078,126 @@ jobs:
 
 **Development**:
 
-- Use User Secrets for local testing
+- Use User Secrets for sensitive values (client secrets - temporary only)
+- Use Azure CLI login (`az login`) for DefaultAzureCredential
 - Point to development tenant
+- `ManagedIdentity:Enabled = false`
+- `ManagedIdentity:UseManagedIdentityForGraph = false`
 
 **Staging**:
 
-- Use Azure Key Vault
+- Use Azure Key Vault (accessed via Managed Identity)
+- Enable System-Assigned Managed Identity on App Service
+- Grant MI access to Key Vault, Graph API, and other resources
 - Separate test Entra ID tenant (or test apps)
+- `ManagedIdentity:Enabled = true`
+- `ManagedIdentity:UseManagedIdentityForGraph = true`
 
 **Production**:
 
-- Use Azure Key Vault
-- Managed Identity for authentication (no secrets in config)
+- **CRITICAL**: Use Managed Identity for ALL Azure resource access
+- Use Azure Key Vault (accessed via Managed Identity)
+- **NO client secrets in configuration**
+- **NO connection strings with credentials**
+- System-Assigned Managed Identity enabled on App Service
+- MI granted Graph API application permissions
+- MI granted Key Vault access (RBAC: "Key Vault Secrets User")
+- MI granted Application Insights access
 - Production tenant
+- `ManagedIdentity:Enabled = true`
+- `ManagedIdentity:UseManagedIdentityForGraph = true`
+
+### 12.5 Entra ID Security Groups Setup
+
+**PREREQUISITE**: Before deploying the application, the following Entra ID security groups must be created and configured.
+
+#### Step-by-Step Group Setup
+
+1. **Create Entra-Admin Group**:
+
+   - Navigate to Azure Portal → Entra ID → Groups
+   - Click "New group"
+   - Group type: Security
+   - Group name: `Entra-Admin`
+   - Group description: "Administrator access to Entra ID App Portal - full permissions including delete"
+   - Membership type: Assigned (or Dynamic User if using rules)
+   - Add initial members (IT administrators)
+   - Copy the **Object ID** (needed for configuration)
+
+2. **Create Entra-Support Group**:
+
+   - Navigate to Azure Portal → Entra ID → Groups
+   - Click "New group"
+   - Group type: Security
+   - Group name: `Entra-Support`
+   - Group description: "Read-only access to Entra ID App Portal - view and export only"
+   - Membership type: Assigned
+   - Add initial members (support staff)
+   - Copy the **Object ID** (needed for configuration)
+
+3. **Get Group Object IDs**:
+
+   ```bash
+   # Using Azure CLI
+   az ad group show --group "Entra-Admin" --query objectId -o tsv
+   az ad group show --group "Entra-Support" --query objectId -o tsv
+
+   # Using PowerShell
+   Get-AzureADGroup -SearchString "Entra-Admin" | Select-Object ObjectId
+   Get-AzureADGroup -SearchString "Entra-Support" | Select-Object ObjectId
+   ```
+
+4. **Update Application Configuration**:
+
+   - Add group Object IDs to Azure Key Vault:
+     - Secret name: `Authorization--AdminGroupId`
+     - Secret name: `Authorization--SupportGroupId`
+   - OR update appsettings.json (for development only):
+
+   ```json
+   "Authorization": {
+     "AdminGroupId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+     "SupportGroupId": "yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy"
+   }
+   ```
+
+5. **Configure App Registration for Group Claims**:
+
+   - Option A: Include groups in token (recommended for < 200 groups per user)
+
+     - Navigate to App Registration → Token Configuration
+     - Click "Add groups claim"
+     - Select "Security groups"
+     - For ID tokens, select "Group ID"
+     - For Access tokens, select "Group ID"
+
+   - Option B: Query groups via API (recommended if users have many groups)
+     - Ensure `GroupMember.Read.All` permission is granted
+     - Application will query groups at runtime
+
+#### Group Management Best Practices
+
+- **Naming Convention**: Use consistent naming (e.g., `Entra-Admin`, `Entra-Support`)
+- **Documentation**: Document group purpose and members
+- **Regular Audits**: Review group membership quarterly
+- **Just-in-Time Access**: Consider using PIM (Privileged Identity Management) for admin group
+- **Testing**: Always test with both admin and support users before production deployment
+
+#### Troubleshooting Group Authorization
+
+**Issue**: User gets "Access Denied" despite being in the group
+
+- Verify user is actually in the correct group (check Entra ID)
+- Check token claims (decode JWT token to verify groups are included)
+- Clear application cache and have user re-login
+- Verify Group Object IDs match in configuration
+- Check group membership cache TTL (default 5 minutes)
+
+**Issue**: Groups not appearing in token
+
+- Check token configuration in app registration
+- If using token-based groups, ensure token size limit is not exceeded (200 group limit)
+- Consider switching to API-based group checking if user has many groups
 
 ---
 
@@ -1042,33 +2205,66 @@ jobs:
 
 1. **Authentication**:
 
-   - Always use HTTPS
-   - Implement proper token refresh
-   - Use Managed Identity in Azure (no secrets)
+   - **Require authentication for ALL pages and API endpoints** (no anonymous access)
+   - Always use HTTPS (enforce with HSTS headers)
+   - Implement OAuth 2.0 Authorization Code Flow with PKCE
+   - Implement proper token refresh (automatic silent renewal)
+   - Use Managed Identity in Azure for app-to-app auth (no secrets in code)
+   - Secure session cookies (HttpOnly, Secure, SameSite=Strict)
+   - Implement proper logout (clear session + Microsoft logout)
 
 2. **Authorization**:
 
-   - Implement RBAC
-   - Least privilege principle
-   - Audit logs for sensitive operations
+   - **Enforce group-based authorization** (Entra-Admin, Entra-Support)
+   - Check group membership on every sensitive operation
+   - Cache group membership checks (5 min TTL) to reduce API calls
+   - Implement least privilege principle
+   - Log all authorization failures
+   - Audit logs for all sensitive operations (delete, refresh)
+   - Display user-friendly "Access Denied" messages (never expose internal details)
 
 3. **Data Protection**:
 
-   - Never log sensitive data
-   - Encrypt data in transit (TLS 1.2+)
-   - Use Azure Key Vault for secrets
+   - Never log sensitive data (tokens, secrets, passwords, PII)
+   - Encrypt data in transit (TLS 1.3 or 1.2+)
+   - Use Azure Key Vault for all secrets and certificates
+   - Never expose group Object IDs in client-side code or error messages
+   - Sanitize all user inputs
+   - Implement proper CORS policy
 
 4. **API Security**:
 
-   - Implement rate limiting
-   - CORS policy (whitelist origins)
-   - Content Security Policy headers
-   - Anti-forgery tokens
+   - Implement rate limiting (per user and global)
+   - CORS policy (whitelist specific origins only)
+   - Content Security Policy (CSP) headers
+   - Anti-forgery tokens for state-changing operations
+   - Validate all inputs (prevent injection attacks)
+   - Implement request size limits
+   - Use API versioning for future changes
 
-5. **Dependency Management**:
-   - Keep NuGet packages up-to-date
-   - Monitor for security vulnerabilities
-   - Use Dependabot for automated updates
+5. **Session Management**:
+
+   - Implement sliding session expiration (30 min idle timeout)
+   - Absolute session timeout (8 hours)
+   - Force logout on browser close (if required)
+   - Clear cache on logout
+   - Regenerate session ID after login
+
+6. **Dependency Management**:
+
+   - Keep all NuGet packages up-to-date
+   - Monitor for security vulnerabilities (GitHub Dependabot)
+   - Use automated security scanning in CI/CD
+   - Review dependencies regularly
+   - Pin package versions in production
+
+7. **Error Handling & Information Disclosure**:
+
+   - Never expose stack traces to users
+   - Use generic error messages for users
+   - Log detailed errors server-side only
+   - Don't reveal system information in error responses
+   - Implement custom error pages (401, 403, 404, 500)
 
 ---
 
@@ -1198,18 +2394,195 @@ Configure alerts for:
 
 ### Launch Checklist:
 
-- [ ] Production Entra ID app registration created
-- [ ] Azure resources provisioned
-- [ ] Key Vault configured with secrets
+**Entra ID Setup:**
+
+- [ ] **Entra ID Security Groups created** (Entra-Admin, Entra-Support)
+- [ ] **Group Object IDs obtained and documented**
+- [ ] **Test users added to security groups**
+- [ ] Production Entra ID app registration created (for user authentication)
+- [ ] **App registration configured with required delegated permissions**:
+  - [ ] User.Read
+  - [ ] Application.Read.All (or Application.ReadWrite.All)
+  - [ ] Directory.Read.All
+  - [ ] GroupMember.Read.All
+  - [ ] Admin consent granted for all delegated permissions
+- [ ] **Token configuration set up** (group claims or API-based)
+
+**Managed Identity Setup (CRITICAL):**
+
+- [ ] **System-Assigned Managed Identity enabled on App Service**
+- [ ] **Managed Identity Object/Principal ID documented**
+- [ ] **Managed Identity granted Graph API application permissions**:
+  - [ ] Application.Read.All (or Application.ReadWrite.All for delete)
+  - [ ] Directory.Read.All
+  - [ ] GroupMember.Read.All
+  - [ ] Permissions granted via PowerShell (New-MgServicePrincipalAppRoleAssignment)
+- [ ] **Managed Identity granted Key Vault access** (RBAC: "Key Vault Secrets User")
+- [ ] **Managed Identity granted Application Insights access** (if using MI for telemetry)
+- [ ] **Managed Identity tested** (acquire token successfully)
+
+**Azure Resources:**
+
+- [ ] Azure App Service provisioned
+- [ ] Azure Key Vault provisioned
+- [ ] Application Insights provisioned
+- [ ] Azure Cache for Redis provisioned (optional)
+- [ ] **Key Vault configured with secrets** (group IDs, not client secrets)
+- [ ] **Group Object IDs added to Key Vault**
+
+**Configuration:**
+
+- [ ] **ManagedIdentity:Enabled = true in production**
+- [ ] **ManagedIdentity:UseManagedIdentityForGraph = true**
+- [ ] **NO client secrets in production configuration**
+- [ ] Key Vault URI configured
+- [ ] DefaultAzureCredential implemented in code
+
+**Deployment:**
+
 - [ ] CI/CD pipeline configured
+- [ ] Publish profile or deployment credentials configured
+- [ ] Environment variables set (non-sensitive only)
+
+**Testing:**
+
+- [ ] **Managed Identity token acquisition tested**
+- [ ] **Graph API calls with Managed Identity tested**
+- [ ] **Key Vault access with Managed Identity tested**
+- [ ] **Authentication flow tested** (login/logout)
+- [ ] **Authorization tested** (admin and support user access)
+- [ ] **Delete operation tested** (admin only)
+
+**Monitoring & Operations:**
+
 - [ ] Monitoring and alerts configured
-- [ ] User roles assigned
+- [ ] Application Insights connected
+- [ ] Audit logging enabled
+- [ ] User roles assigned (group memberships)
 - [ ] Backup and disaster recovery plan
 - [ ] Runbook for common operations
 
+**Security Review:**
+
+- [ ] **Security review completed** (all endpoints require auth)
+- [ ] **Verified: No client secrets in code or configuration**
+- [ ] **Verified: All Azure resources accessed via Managed Identity**
+- [ ] **Verified: Least privilege permissions granted**
+- [ ] Penetration testing completed (if required)
+
 ---
 
-## 18. Appendix
+## 18. Quick Reference: Authentication & Authorization
+
+### Access Control Matrix
+
+| Feature / Action            | Anonymous User       | Authenticated (No Group) | Entra-Support (Reader) | Entra-Admin (Administrator) |
+| --------------------------- | -------------------- | ------------------------ | ---------------------- | --------------------------- |
+| **Access Portal**           | ❌ Redirect to login | ❌ Access Denied page    | ✅ Allowed             | ✅ Allowed                  |
+| **View App List**           | ❌                   | ❌                       | ✅                     | ✅                          |
+| **Apply Filters**           | ❌                   | ❌                       | ✅                     | ✅                          |
+| **View Details**            | ❌                   | ❌                       | ✅                     | ✅                          |
+| **Export Data**             | ❌                   | ❌                       | ✅                     | ✅                          |
+| **Refresh Cache**           | ❌                   | ❌                       | ❌ (optional: ✅)      | ✅                          |
+| **Delete App Registration** | ❌                   | ❌                       | ❌                     | ✅                          |
+| **View Expiring Secrets**   | ❌                   | ❌                       | ✅                     | ✅                          |
+
+### Required Entra ID Groups
+
+| Group Name        | Object ID Location                            | Purpose                    | Members                  |
+| ----------------- | --------------------------------------------- | -------------------------- | ------------------------ |
+| **Entra-Admin**   | Configuration: `Authorization:AdminGroupId`   | Full administrative access | IT Admins, DevOps leads  |
+| **Entra-Support** | Configuration: `Authorization:SupportGroupId` | Read-only support access   | Support staff, Help desk |
+
+### Required API Permissions (Delegated - for User Authentication)
+
+**App Registration Delegated Permissions** (for signing in users):
+
+```
+✅ User.Read                    - Sign in and read user profile
+✅ Application.Read.All          - Read applications (on behalf of user)
+   Application.ReadWrite.All     - Required for delete operations
+✅ Directory.Read.All            - Read directory data
+✅ GroupMember.Read.All          - Read user's group memberships
+```
+
+### Required API Permissions (Application - for Managed Identity)
+
+**Managed Identity Application Permissions** (for accessing Graph API without user context):
+
+```
+✅ Application.Read.All          - Read all applications (minimum)
+   Application.ReadWrite.All     - Required for delete operations
+✅ Directory.Read.All            - Read directory data
+✅ GroupMember.Read.All          - Read group memberships
+
+⚠️ CRITICAL: These must be assigned to the Managed Identity Service Principal
+   using PowerShell: New-MgServicePrincipalAppRoleAssignment
+```
+
+### Managed Identity vs User Authentication
+
+| Aspect              | User Authentication (Delegated)    | Managed Identity (Application)    |
+| ------------------- | ---------------------------------- | --------------------------------- |
+| **Purpose**         | Sign in users to web portal        | Access Graph API on behalf of app |
+| **Credential Type** | OAuth2 tokens (user context)       | Managed Identity (app context)    |
+| **Permission Type** | Delegated permissions              | Application permissions           |
+| **Setup**           | App Registration + user consent    | System MI + PowerShell grant      |
+| **Use Case**        | User login, group membership check | Load app registrations from Graph |
+
+### Authentication Flow Summary
+
+```
+1. User visits portal URL
+   ↓
+2. Check if authenticated?
+   ├─ No → Redirect to Microsoft login
+   │        ↓
+   │        User logs in with Entra ID credentials
+   │        ↓
+   │        Acquire tokens (ID token + Access token)
+   │        ↓
+   └─ Yes → Continue
+   ↓
+3. Check group membership (Entra-Admin OR Entra-Support)?
+   ├─ Yes → Grant access with appropriate permissions
+   └─ No → Show "Access Denied" page
+```
+
+### Configuration Checklist
+
+**User Authentication (App Registration):**
+
+- [ ] `AzureAd:TenantId` - Your Entra ID tenant ID
+- [ ] `AzureAd:ClientId` - App registration client ID (for user sign-in)
+- [ ] `AzureAd:ClientSecret` - App registration secret (DEV ONLY - User Secrets)
+- [ ] App Registration: Redirect URI configured
+- [ ] App Registration: Delegated permissions granted + admin consent
+- [ ] App Registration: Token configuration (group claims OR API access)
+
+**Managed Identity (Production):**
+
+- [ ] `ManagedIdentity:Enabled` - Set to true in production
+- [ ] `ManagedIdentity:UseManagedIdentityForGraph` - Set to true in production
+- [ ] System-Assigned Managed Identity enabled on App Service
+- [ ] Managed Identity granted Graph API application permissions
+- [ ] Managed Identity granted Key Vault access
+
+**Authorization:**
+
+- [ ] `Authorization:AdminGroupId` - Object ID of Entra-Admin group
+- [ ] `Authorization:SupportGroupId` - Object ID of Entra-Support group
+- [ ] Group IDs stored in Key Vault (accessed via Managed Identity)
+
+**Azure Resources:**
+
+- [ ] `KeyVault:VaultUri` - Azure Key Vault URI
+- [ ] `KeyVault:UseManagedIdentity` - Set to true in production
+- [ ] Application Insights configured (connection string from Key Vault or empty for MI)
+
+---
+
+## 19. Appendix
 
 ### A. Glossary
 
@@ -1217,14 +2590,54 @@ Configure alerts for:
 - **App Registration**: Azure AD application registration for OAuth/OIDC
 - **Graph API**: Microsoft Graph API for accessing Microsoft 365 data
 - **Aspire**: .NET Aspire framework for cloud-native applications
-- **Managed Identity**: Azure AD identity for Azure resources
+- **Managed Identity (MI)**: Azure-managed identity for secure resource access without storing credentials
+  - **System-Assigned MI**: Tied to the lifecycle of the Azure resource (preferred)
+  - **User-Assigned MI**: Standalone identity that can be assigned to multiple resources
+- **DefaultAzureCredential**: Azure SDK credential chain that automatically selects the best authentication method
+- **TokenCredential**: Base type for all Azure SDK authentication mechanisms
+- **OAuth 2.0**: Open standard for access delegation and authorization
+- **PKCE**: Proof Key for Code Exchange - security extension for OAuth2
+- **Delegated Permissions**: Permissions that require a signed-in user (user context)
+- **Application Permissions**: Permissions for apps running without a user (app context)
+- **Service Principal**: Enterprise application representation of an app or managed identity in Entra ID
+- **Security Group**: Entra ID group used for access control and permissions
+- **Group Claims**: User's group memberships included in authentication tokens
+- **MSAL**: Microsoft Authentication Library for acquiring tokens
+- **Azure RBAC**: Role-Based Access Control for Azure resource authorization
+- **Key Vault**: Azure service for securely storing secrets, keys, and certificates
 
 ### B. References
+
+**Core Technologies:**
 
 - [Microsoft Graph API Documentation](https://learn.microsoft.com/graph)
 - [.NET Aspire Documentation](https://learn.microsoft.com/dotnet/aspire)
 - [Azure App Service Documentation](https://learn.microsoft.com/azure/app-service)
+
+**Authentication & Authorization:**
+
 - [Microsoft Identity Platform](https://learn.microsoft.com/entra/identity-platform)
+- [Microsoft.Identity.Web Documentation](https://learn.microsoft.com/entra/msal/dotnet/microsoft-identity-web/)
+- [OAuth 2.0 Authorization Code Flow](https://learn.microsoft.com/entra/identity-platform/v2-oauth2-auth-code-flow)
+- [Configure Group Claims](https://learn.microsoft.com/entra/identity-platform/optional-claims)
+- [Entra ID Security Groups](https://learn.microsoft.com/entra/fundamentals/how-to-manage-groups)
+
+**Managed Identity & Azure SDK:**
+
+- [Azure Identity SDK (Azure.Identity)](https://learn.microsoft.com/dotnet/api/overview/azure/identity-readme)
+- [DefaultAzureCredential](https://learn.microsoft.com/dotnet/api/azure.identity.defaultazurecredential)
+- [Managed Identities Overview](https://learn.microsoft.com/entra/identity/managed-identities-azure-resources/overview)
+- [How to use Managed Identity with App Service](https://learn.microsoft.com/azure/app-service/overview-managed-identity)
+- [Authenticate to Azure resources from .NET apps](https://learn.microsoft.com/dotnet/azure/sdk/authentication)
+- [Best Practices for Azure SDK](https://learn.microsoft.com/dotnet/azure/sdk/best-practices)
+- [Grant Managed Identity access to Microsoft Graph](https://learn.microsoft.com/graph/sdks/choose-authentication-providers#application-authentication)
+
+**Azure Services:**
+
+- [Azure Key Vault SDK](https://learn.microsoft.com/dotnet/api/overview/azure/security.keyvault.secrets-readme)
+- [Azure Key Vault with Managed Identity](https://learn.microsoft.com/azure/key-vault/general/managed-identity)
+- [Application Insights SDK](https://learn.microsoft.com/azure/azure-monitor/app/asp-net-core)
+- [Azure Cache for Redis](https://learn.microsoft.com/azure/azure-cache-for-redis/cache-dotnet-core-quickstart)
 
 ### C. Contact & Support
 
@@ -1234,6 +2647,181 @@ Configure alerts for:
 
 ---
 
-**Document Version**: 1.0  
+## 20. Implementation Summary - Managed Identity Best Practices
+
+### Key Security Implementation
+
+This application implements **Azure Managed Identity with DefaultAzureCredential** following Microsoft's best practices:
+
+#### 1. **Credential Flow (DefaultAzureCredential Chain)**
+
+```
+Development (Local):
+  User runs: az login
+    ↓
+  DefaultAzureCredential uses AzureCliCredential
+    ↓
+  Application authenticates as the developer
+    ↓
+  Accesses Azure resources with developer's permissions
+
+Production (Azure):
+  App Service has System-Assigned Managed Identity
+    ↓
+  DefaultAzureCredential uses ManagedIdentityCredential
+    ↓
+  Application authenticates as the Managed Identity
+    ↓
+  Accesses Azure resources with MI's assigned permissions
+```
+
+#### 2. **Resource Access Pattern**
+
+All Azure services are accessed using the same pattern:
+
+```csharp
+// Single credential instance for all services
+var credential = new DefaultAzureCredential();
+
+// Key Vault
+var secretClient = new SecretClient(vaultUri, credential);
+
+// Microsoft Graph
+var graphClient = new GraphServiceClient(credential, scopes);
+
+// Application Insights (automatic with MI)
+builder.Services.AddApplicationInsightsTelemetry();
+```
+
+#### 3. **Zero-Secrets Checklist**
+
+✅ **NO** `ClientSecret` in production configuration  
+✅ **NO** connection strings with passwords  
+✅ **NO** API keys in environment variables  
+✅ **NO** SAS tokens hardcoded  
+✅ All credentials acquired automatically by Azure  
+✅ Developers use their own Azure credentials locally  
+✅ Production uses Managed Identity exclusively
+
+#### 4. **Required NuGet Packages**
+
+```xml
+<!-- Core Azure Identity -->
+<PackageReference Include="Azure.Identity" Version="1.13.*" />
+
+<!-- Azure Services -->
+<PackageReference Include="Azure.Security.KeyVault.Secrets" Version="4.6.*" />
+<PackageReference Include="Azure.Extensions.AspNetCore.Configuration.Secrets" Version="1.3.*" />
+
+<!-- Microsoft Graph with Identity -->
+<PackageReference Include="Microsoft.Graph" Version="5.*" />
+<PackageReference Include="Microsoft.Identity.Web" Version="3.*" />
+<PackageReference Include="Microsoft.Identity.Web.MicrosoftGraph" Version="3.*" />
+```
+
+#### 5. **Managed Identity Setup Commands**
+
+```bash
+# Enable System-Assigned MI on App Service
+az webapp identity assign --name <app-name> --resource-group <rg-name>
+
+# Grant Key Vault access
+az role assignment create \
+  --role "Key Vault Secrets User" \
+  --assignee <mi-principal-id> \
+  --scope /subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<kv-name>
+```
+
+```powershell
+# Grant Graph API permissions to Managed Identity
+Connect-MgGraph -Scopes "Application.ReadWrite.All"
+
+$managedIdentityObjectId = "<mi-principal-id>"
+$graphSp = Get-MgServicePrincipal -Filter "displayName eq 'Microsoft Graph'"
+
+# Assign Application.Read.All permission
+$appRole = $graphSp.AppRoles | Where-Object { $_.Value -eq "Application.Read.All" }
+New-MgServicePrincipalAppRoleAssignment `
+  -ServicePrincipalId $managedIdentityObjectId `
+  -PrincipalId $managedIdentityObjectId `
+  -ResourceId $graphSp.Id `
+  -AppRoleId $appRole.Id
+```
+
+#### 6. **Benefits Achieved**
+
+| Benefit                      | Description                                 |
+| ---------------------------- | ------------------------------------------- |
+| 🔐 **Zero Secrets**          | No credentials to manage, rotate, or leak   |
+| 🛡️ **Enhanced Security**     | Azure manages all credentials automatically |
+| 🚀 **Simplified Deployment** | No secret injection in CI/CD pipelines      |
+| 📊 **Complete Audit Trail**  | All access logged with MI identity          |
+| 👨‍💻 **Developer Friendly**    | Seamless local development with `az login`  |
+| ♻️ **No Rotation Required**  | Azure handles credential lifecycle          |
+| 🎯 **Least Privilege**       | Fine-grained RBAC permissions per resource  |
+
+#### 7. **Authentication Architecture**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                       User Access                            │
+│  (OAuth2 Code Flow - Microsoft.Identity.Web)                │
+│                                                              │
+│  User → Azure AD Login → ID Token → Portal Access           │
+│                                                              │
+│  Groups: Entra-Admin (full) or Entra-Support (read-only)   │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                  Blazor Web Application                      │
+│                (User Context - Delegated)                    │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                     Backend API Service                      │
+│            (App Context - Managed Identity)                  │
+│                                                              │
+│  DefaultAzureCredential → ManagedIdentityCredential          │
+└─────────────┬───────────────────────────────┬───────────────┘
+              │                               │
+              ▼                               ▼
+    ┌─────────────────┐           ┌──────────────────┐
+    │ Microsoft Graph │           │  Azure Key Vault │
+    │  (App Perms)    │           │   (RBAC Access)  │
+    │                 │           │                  │
+    │ - Get Apps      │           │ - Group IDs      │
+    │ - Delete Apps   │           │ - Config Values  │
+    └─────────────────┘           └──────────────────┘
+```
+
+#### 8. **Troubleshooting Quick Reference**
+
+| Issue                                     | Solution                                         |
+| ----------------------------------------- | ------------------------------------------------ |
+| Local: "Failed to retrieve token"         | Run `az login` and verify with `az account show` |
+| Azure: "ManagedIdentityCredential failed" | Enable System-Assigned MI on App Service         |
+| "Access denied" to Key Vault              | Grant "Key Vault Secrets User" role to MI        |
+| "AADSTS700016" Graph API error            | Grant Graph API app roles to MI using PowerShell |
+| Token acquisition slow                    | Check MI is enabled and permissions are correct  |
+
+#### 9. **Critical Deployment Steps**
+
+1. ✅ Enable System-Assigned Managed Identity on App Service
+2. ✅ Grant MI access to Key Vault (RBAC: Key Vault Secrets User)
+3. ✅ Grant MI access to Microsoft Graph (PowerShell: App Role Assignment)
+4. ✅ Update configuration: `ManagedIdentity:Enabled = true`
+5. ✅ Update configuration: `ManagedIdentity:UseManagedIdentityForGraph = true`
+6. ✅ Remove any client secrets from production configuration
+7. ✅ Test token acquisition in staging environment first
+8. ✅ Verify all Graph API calls work with MI
+9. ✅ Verify Key Vault access works with MI
+10. ✅ Deploy to production
+
+---
+
+**Document Version**: 2.0 (Updated with Managed Identity)  
 **Last Updated**: November 22, 2025  
-**Status**: Ready for Development
+**Status**: Ready for Development  
+**Security Model**: Zero-Secrets Architecture with Managed Identity
