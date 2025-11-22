@@ -10,6 +10,7 @@ Build a modern web portal to manage and monitor Azure Entra ID (formerly Azure A
 
 - Provide a secure, authenticated web portal for authorized users only
 - **Use Managed Identity for all Azure resource access (zero secrets in production)**
+- **Enable easy local development** - same code works locally and in Azure
 - Provide a user-friendly interface to view and manage Entra ID app registrations
 - Enable proactive monitoring of expiring secrets and certificates
 - Reduce Microsoft Graph API calls through intelligent caching
@@ -26,7 +27,31 @@ Build a modern web portal to manage and monitor Azure Entra ID (formerly Azure A
 - ✅ All Azure resources accessed via **Managed Identity**
 - ✅ All credentials managed automatically by Azure
 - ✅ Developers use their own credentials locally (Azure CLI, VS Code)
-- ✅ Production uses System-Assigned Managed Identity
+- ✅ Production uses **User-Assigned Managed Identity** (reusable across resources)
+
+**Why User-Assigned Managed Identity?**
+- ✅ Independent lifecycle (not tied to App Service)
+- ✅ Can be shared across multiple Azure resources (Web App, Functions, VMs)
+- ✅ Created and configured before deployment
+- ✅ Easier to manage permissions centrally
+- ✅ Better for multi-resource deployments (Aspire scenarios)
+
+**Why Easy Local Development Matters:**
+- ✅ **Same configuration code** works locally and in Azure (no conditional logic!)
+- ✅ **Same permissions** - Development MI mirrors production MI permissions
+- ✅ **F5 debugging** - No admin permissions needed for individual developers
+- ✅ **User Secrets** (`secrets.json`) keeps configuration local and out of git
+- ✅ **DefaultAzureCredential** automatically picks right credential (Dev MI or Azure CLI)
+- ✅ **No environment detection code** needed - it just works!
+- ✅ **Fast development cycle** - no deployment needed to test
+
+**Development Managed Identity Approach:**
+Instead of requiring developers to have admin permissions (like `Application.Read.All`), we create a **Development User-Assigned MI** that:
+- Has the same Graph API permissions as production MI
+- Is shared by all developers
+- Eliminates need for individual admin permissions
+- Provides consistent testing environment
+- Works seamlessly with DefaultAzureCredential
 
 ### 1.4 Target Audience
 
@@ -71,7 +96,7 @@ Build a modern web portal to manage and monitor Azure Entra ID (formerly Azure A
 ### 2.5 Cloud & DevOps
 
 - **Hosting**: Azure App Service or Azure Container Apps
-- **Identity**: Managed Identity (System-assigned preferred)
+- **Identity**: **User-Assigned Managed Identity** (reusable across resources)
 - **Configuration**: Azure Key Vault accessed via Managed Identity (no secrets in code)
 - **Monitoring**: Application Insights (connected via Managed Identity)
 - **Resource Access**: DefaultAzureCredential for all Azure services
@@ -525,10 +550,27 @@ public class DeleteResponse
 
 ### 6.1 Configuration Hierarchy (Priority Order)
 
-1. **User Secrets** (`secrets.json`) - Development only
-2. **Local Settings** (`appsettings.Development.json`) - Development
-3. **Azure Key Vault** - Production
-4. **Environment Variables** - Fallback
+**IMPORTANT**: The same configuration structure works both locally and in Azure. Only the source changes!
+
+**Local Development (Priority Order - Highest to Lowest):**
+1. **User Secrets** (`secrets.json`) - Highest priority for sensitive local values
+2. **Local Settings** (`appsettings.Development.json` or `local.settings.json`) - Local overrides
+3. **Base Settings** (`appsettings.json`) - Default values
+4. **Environment Variables** - Final fallback
+
+**Azure Production (Priority Order - Highest to Lowest):**
+1. **Azure App Configuration** (optional) - Dynamic configuration
+2. **Azure Key Vault** - Secrets loaded via Managed Identity
+3. **App Service Configuration** (App Settings) - Environment-specific values
+4. **Base Settings** (`appsettings.json`) - Default values
+5. **Environment Variables** - Final fallback
+
+**Key Benefits**:
+- ✅ Same JSON structure works everywhere
+- ✅ Developers never touch production secrets
+- ✅ DefaultAzureCredential automatically selects correct auth method
+- ✅ No code changes between local and cloud
+- ✅ Easy to debug locally with Azure CLI login
 
 ### 6.2 Required Configuration Keys
 
@@ -544,7 +586,7 @@ public class DeleteResponse
   },
   "ManagedIdentity": {
     "Enabled": true, // Set to true in Azure, false for local development
-    "ClientId": "<user-assigned-mi-client-id>", // Optional: For user-assigned MI
+    "ClientId": "<user-assigned-mi-client-id>", // REQUIRED: User-Assigned MI Client ID
     "UseManagedIdentityForGraph": true // Use Managed Identity for Graph API calls
   },
   "Authorization": {
@@ -589,46 +631,347 @@ public class DeleteResponse
 }
 ```
 
-### 6.3 Configuration Implementation
+### 6.3 Configuration Implementation - Works Locally and in Azure
+
+**DESIGN PRINCIPLE**: Same configuration code works in both local development and Azure production. DefaultAzureCredential automatically detects the environment!
 
 ```csharp
-// Program.cs - Configuration loading order
+// Program.cs - Unified configuration loading for local AND Azure
+using Azure.Identity;
+
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Base configuration (appsettings.json)
-// Already loaded by default
+// ============================================================================
+// CONFIGURATION LOADING ORDER
+// ============================================================================
+// By default, .NET loads in this order:
+// 1. appsettings.json (base configuration)
+// 2. appsettings.{Environment}.json (e.g., appsettings.Development.json)
+// 3. User Secrets (Development only) - WE ADD THIS EXPLICITLY
+// 4. Environment variables
+// 5. Command-line arguments
 
-// 2. Environment-specific configuration
-// Already loaded by default
-
-// 3. User Secrets (development only)
+// ============================================================================
+// STEP 1: Add User Secrets (Development - HIGHEST PRIORITY for secrets)
+// ============================================================================
 if (builder.Environment.IsDevelopment())
 {
-    builder.Configuration.AddUserSecrets<Program>();
+    // Load secrets.json (managed via: dotnet user-secrets set "Key" "Value")
+    builder.Configuration.AddUserSecrets<Program>(optional: true);
+    
+    // IMPORTANT: Map User Secrets to Environment Variables for DefaultAzureCredential
+    // DefaultAzureCredential looks for AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID
+    // in environment variables, so we map them from configuration
+    var clientId = builder.Configuration["AZURE_CLIENT_ID"];
+    var clientSecret = builder.Configuration["AZURE_CLIENT_SECRET"];
+    var tenantId = builder.Configuration["AZURE_TENANT_ID"];
+    
+    if (!string.IsNullOrEmpty(clientId))
+    {
+        Environment.SetEnvironmentVariable("AZURE_CLIENT_ID", clientId);
+        Environment.SetEnvironmentVariable("AZURE_CLIENT_SECRET", clientSecret);
+        Environment.SetEnvironmentVariable("AZURE_TENANT_ID", tenantId);
+    }
+    
+    // OPTIONAL: Also check for local.settings.json (common in Azure Functions)
+    builder.Configuration.AddJsonFile("local.settings.json", optional: true, reloadOnChange: true);
 }
 
-// 4. Environment variables (always)
+// ============================================================================
+// STEP 2: Environment variables (ALWAYS)
+// ============================================================================
 builder.Configuration.AddEnvironmentVariables();
 
-// 5. Azure Key Vault (production)
-if (!builder.Environment.IsDevelopment())
+// ============================================================================
+// STEP 3: Create DefaultAzureCredential (Works locally AND in Azure!)
+// ============================================================================
+// Local Development: Uses Azure CLI (`az login`) or Visual Studio credentials
+// Azure Production: Uses User-Assigned Managed Identity
+var managedIdentityClientId = builder.Configuration["ManagedIdentity:ClientId"];
+
+var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
 {
-    var keyVaultUrl = builder.Configuration["KeyVault:VaultUri"];
-    if (!string.IsNullOrEmpty(keyVaultUrl))
+    // Specify User-Assigned MI Client ID (ignored locally, used in Azure)
+    ManagedIdentityClientId = managedIdentityClientId,
+    
+    // Local development: Try these in order
+    ExcludeInteractiveBrowserCredential = true,  // Don't prompt user
+    
+    // Production: Will use ManagedIdentityCredential
+    // Development: Will use AzureCliCredential or VisualStudioCredential
+});
+
+// Register credential for dependency injection
+builder.Services.AddSingleton<TokenCredential>(credential);
+
+// ============================================================================
+// STEP 4: Azure Key Vault (Production - loads secrets via Managed Identity)
+// ============================================================================
+// Local Development: If KeyVault:VaultUri is set, uses Azure CLI credentials
+// Azure Production: Uses User-Assigned Managed Identity
+var keyVaultUri = builder.Configuration["KeyVault:VaultUri"];
+if (!string.IsNullOrEmpty(keyVaultUri))
+{
+    try
     {
         builder.Configuration.AddAzureKeyVault(
-            new Uri(keyVaultUrl),
-            new DefaultAzureCredential());
+            new Uri(keyVaultUri),
+            credential);  // Same credential works locally and in Azure!
+        
+        builder.Logging.AddConsole().SetMinimumLevel(LogLevel.Information);
+        var logger = builder.Services.BuildServiceProvider().GetRequiredService<ILogger<Program>>();
+        logger.LogInformation("✅ Key Vault configuration loaded from: {VaultUri}", keyVaultUri);
+    }
+    catch (Exception ex)
+    {
+        // Non-fatal: Key Vault might not be accessible locally (that's OK!)
+        builder.Logging.AddConsole();
+        var logger = builder.Services.BuildServiceProvider().GetRequiredService<ILogger<Program>>();
+        logger.LogWarning(ex, "⚠️  Could not load Key Vault. Using local configuration.");
     }
 }
 
-// Options pattern
+// ============================================================================
+// STEP 5: Configure Options Pattern
+// ============================================================================
 builder.Services.Configure<AzureAdOptions>(
     builder.Configuration.GetSection("AzureAd"));
 builder.Services.Configure<GraphApiOptions>(
     builder.Configuration.GetSection("GraphApi"));
 builder.Services.Configure<ManagedIdentityOptions>(
     builder.Configuration.GetSection("ManagedIdentity"));
+
+// ============================================================================
+// LOG CONFIGURATION SOURCE (Helpful for debugging)
+// ============================================================================
+if (builder.Environment.IsDevelopment())
+{
+    var config = builder.Configuration;
+    Console.WriteLine("=== Configuration Sources (Priority Order) ===");
+    Console.WriteLine($"1. User Secrets: {(config.GetSection("AzureAd:ClientSecret").Exists() ? "✅ Loaded" : "❌ Not found")}");
+    Console.WriteLine($"2. local.settings.json: {(File.Exists("local.settings.json") ? "✅ Found" : "❌ Not found")}");
+    Console.WriteLine($"3. appsettings.Development.json: ✅ Loaded");
+    Console.WriteLine($"4. Environment Variables: ✅ Available");
+    Console.WriteLine($"5. Key Vault: {(!string.IsNullOrEmpty(keyVaultUri) ? $"✅ {keyVaultUri}" : "❌ Not configured")}");
+    Console.WriteLine("===========================================");
+}
+```
+
+### 6.3.1 Local Development Setup Guide
+
+**Step 1: Install Prerequisites**
+
+```bash
+# Install .NET 10 SDK
+# Download from: https://dotnet.microsoft.com/download/dotnet/10.0
+
+# Install Azure CLI (for DefaultAzureCredential local auth)
+# Windows: Download from https://aka.ms/installazurecliwindows
+# macOS: brew install azure-cli
+# Linux: curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+# Login to Azure (this is what DefaultAzureCredential will use locally!)
+az login
+
+# Set your subscription (if you have multiple)
+az account set --subscription "<your-subscription-id>"
+
+# Verify
+az account show
+```
+
+**Step 2: Initialize User Secrets (secrets.json)**
+
+```bash
+# Navigate to your project directory
+cd entra-id-app-portal/entra-id-app-portal.Web
+
+# Initialize user secrets
+dotnet user-secrets init
+
+# Add your secrets (these stay LOCAL and never get committed to git!)
+dotnet user-secrets set "AzureAd:ClientSecret" "your-dev-client-secret-here"
+dotnet user-secrets set "Authorization:AdminGroupId" "your-admin-group-object-id"
+dotnet user-secrets set "Authorization:SupportGroupId" "your-support-group-object-id"
+
+# Optional: Set Managed Identity to disabled for local dev
+dotnet user-secrets set "ManagedIdentity:Enabled" "false"
+dotnet user-secrets set "ManagedIdentity:UseManagedIdentityForGraph" "false"
+
+# List all secrets (to verify)
+dotnet user-secrets list
+```
+
+**Where are User Secrets stored?**
+- Windows: `%APPDATA%\Microsoft\UserSecrets\<user_secrets_id>\secrets.json`
+- macOS/Linux: `~/.microsoft/usersecrets/<user_secrets_id>/secrets.json`
+
+**Step 3: Create appsettings.Development.json (optional local overrides)**
+
+```json
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Debug",
+      "Microsoft": "Information",
+      "Microsoft.AspNetCore": "Warning"
+    }
+  },
+  "AzureAd": {
+    "Instance": "https://login.microsoftonline.com/",
+    "TenantId": "<your-dev-tenant-id>",
+    "ClientId": "<your-dev-app-registration-client-id>",
+    // ClientSecret is in secrets.json - NOT here!
+    "CallbackPath": "/signin-oidc",
+    "SignedOutCallbackPath": "/signout-callback-oidc"
+  },
+  "ManagedIdentity": {
+    "Enabled": false,  // Use Azure CLI credentials locally
+    "UseManagedIdentityForGraph": false  // Use delegated auth locally
+  },
+  "GraphApi": {
+    "BaseUrl": "https://graph.microsoft.com/v1.0",
+    "Scopes": ["https://graph.microsoft.com/.default"],
+    "BatchSize": 999,
+    "RetryAttempts": 3,
+    "RetryDelaySeconds": 2
+  },
+  "KeyVault": {
+    "VaultUri": "",  // Leave empty for local dev (use secrets.json instead)
+    "UseManagedIdentity": false
+  }
+}
+```
+
+**Step 4: Create local.settings.json (alternative to appsettings.Development.json)**
+
+```json
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureAd__TenantId": "<your-dev-tenant-id>",
+    "AzureAd__ClientId": "<your-dev-app-registration-client-id>",
+    "ManagedIdentity__Enabled": "false"
+  }
+}
+```
+
+**Step 5: Add to .gitignore (CRITICAL!)**
+
+```gitignore
+# User-specific files
+*.user
+*.userosscache
+*.suo
+
+# User Secrets
+secrets.json
+**/secrets.json
+
+# Local settings
+local.settings.json
+appsettings.local.json
+
+# Environment files
+.env
+.env.local
+```
+
+### 6.3.2 Local Debugging Experience
+
+**F5 Debugging - It Just Works!**
+
+```csharp
+// When you press F5 in Visual Studio:
+// 1. Application starts in Development environment
+// 2. Loads appsettings.json (base config)
+// 3. Loads appsettings.Development.json (dev overrides)
+// 4. Loads secrets.json via User Secrets (sensitive values)
+// 5. Loads local.settings.json (if present)
+// 6. Applies environment variables (if any)
+// 7. DefaultAzureCredential uses Azure CLI credentials (from `az login`)
+// 8. All your configuration is ready!
+
+// NO CHANGES NEEDED FOR PRODUCTION - Same code works in Azure!
+```
+
+**Debugging Configuration Issues:**
+
+```csharp
+// Add to Program.cs (Development only) for troubleshooting
+if (builder.Environment.IsDevelopment())
+{
+    var config = builder.Configuration;
+    
+    // Check what values are loaded
+    Console.WriteLine($"Tenant ID: {config["AzureAd:TenantId"]}");
+    Console.WriteLine($"Client ID: {config["AzureAd:ClientId"]}");
+    Console.WriteLine($"Has Client Secret: {!string.IsNullOrEmpty(config["AzureAd:ClientSecret"])}");
+    Console.WriteLine($"MI Enabled: {config["ManagedIdentity:Enabled"]}");
+    Console.WriteLine($"MI Client ID: {config["ManagedIdentity:ClientId"] ?? "Not set"}");
+    
+    // Test DefaultAzureCredential
+    try
+    {
+        var testToken = await credential.GetTokenAsync(
+            new TokenRequestContext(new[] { "https://graph.microsoft.com/.default" }));
+        Console.WriteLine($"✅ DefaultAzureCredential working! Token expires: {testToken.ExpiresOn}");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"❌ DefaultAzureCredential failed: {ex.Message}");
+        Console.WriteLine("💡 Tip: Run 'az login' to authenticate locally");
+    }
+}
+```
+
+### 6.3.3 Configuration Comparison: Local vs Azure
+
+| Aspect | Local Development | Azure Production |
+|--------|-------------------|------------------|
+| **Auth Method** | Azure CLI (`az login`) | User-Assigned Managed Identity |
+| **Secrets Storage** | secrets.json (User Secrets) | Azure Key Vault |
+| **Configuration** | appsettings.Development.json | App Service Configuration |
+| **DefaultAzureCredential** | Uses AzureCliCredential | Uses ManagedIdentityCredential |
+| **Key Vault Access** | Optional (via Azure CLI) | Required (via Managed Identity) |
+| **Client Secret** | In secrets.json (dev only) | Not used (MI instead) |
+| **Configuration Changes** | **NONE - Same code!** | **NONE - Same code!** |
+
+### 6.3.4 Environment Detection Logic
+
+```csharp
+// The application automatically detects where it's running!
+public class EnvironmentService
+{
+    private readonly IWebHostEnvironment _environment;
+    private readonly IConfiguration _configuration;
+    
+    public bool IsRunningInAzure()
+    {
+        // Azure App Service sets this environment variable
+        return !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("WEBSITE_INSTANCE_ID"));
+    }
+    
+    public bool IsUsingManagedIdentity()
+    {
+        return _configuration.GetValue<bool>("ManagedIdentity:Enabled") && IsRunningInAzure();
+    }
+    
+    public bool IsLocalDevelopment()
+    {
+        return _environment.IsDevelopment() && !IsRunningInAzure();
+    }
+    
+    public string GetConfigurationSource()
+    {
+        if (IsLocalDevelopment())
+            return "secrets.json + appsettings.Development.json + Azure CLI";
+        else if (IsRunningInAzure())
+            return "Azure Key Vault + App Service Configuration + Managed Identity";
+        else
+            return "appsettings.json + Environment Variables";
+    }
+}
 ```
 
 ---
@@ -637,15 +980,37 @@ builder.Services.Configure<ManagedIdentityOptions>(
 
 ### Overview
 
-**CRITICAL SECURITY REQUIREMENT**: This application MUST use **Managed Identity** to access Azure resources and Microsoft Graph API. NO client secrets or certificates should be used in production.
+**CRITICAL SECURITY REQUIREMENT**: This application MUST use **User-Assigned Managed Identity** to access Azure resources and Microsoft Graph API. NO client secrets or certificates should be used in production.
 
-**Benefits**:
+**Benefits of User-Assigned Managed Identity**:
 
 - ✅ No secrets to manage or rotate
 - ✅ Automatic credential management by Azure
+- ✅ **Independent lifecycle** - not deleted when App Service is deleted
+- ✅ **Reusable** - same identity across Web App, API, Functions, etc.
+- ✅ **Pre-created** - set up permissions before deploying application
 - ✅ Enhanced security posture
-- ✅ Simplified deployment and operations
+- ✅ Simplified multi-resource deployments (Aspire AppHost + Services)
 - ✅ Audit trail of all resource access
+
+**Why User-Assigned vs System-Assigned Managed Identity?**
+
+| Aspect | System-Assigned MI | User-Assigned MI (Recommended) |
+|--------|-------------------|--------------------------------|
+| **Lifecycle** | Tied to resource (deleted with App Service) | Independent (survives resource deletion) |
+| **Reusability** | One per resource | Shared across multiple resources |
+| **Setup Timing** | Created after resource exists | Created before resource deployment |
+| **Permission Management** | Per resource | Centralized (one set of permissions) |
+| **Aspire Compatibility** | Must configure each service separately | Assign same MI to all services |
+| **Best For** | Single resource scenarios | Multi-resource apps, Aspire, microservices |
+| **Configuration Complexity** | Simple (no Client ID needed) | Requires Client ID in config |
+
+**Recommendation for this project**: Use **User-Assigned MI** because:
+1. .NET Aspire may deploy multiple services (Web, API, Background workers)
+2. All services need same permissions (Graph API, Key Vault)
+3. Easier to manage permissions centrally
+4. Can pre-configure everything before first deployment
+5. Safer for blue-green deployments (MI not deleted with old slot)
 
 ### 6.4.1 DefaultAzureCredential Chain
 
@@ -655,7 +1020,7 @@ Use `DefaultAzureCredential` from Azure.Identity SDK - it provides a credential 
 
 1. **EnvironmentCredential** - Reads account info from environment variables
 2. **WorkloadIdentityCredential** - Azure Kubernetes Service workload identity
-3. **ManagedIdentityCredential** - System or User-assigned Managed Identity (Azure resources)
+3. **ManagedIdentityCredential** - User-Assigned Managed Identity (Azure resources)
 4. **SharedTokenCacheCredential** - Uses cached credentials from developer tools
 5. **VisualStudioCredential** - Uses signed-in Visual Studio account
 6. **VisualStudioCodeCredential** - Uses signed-in VS Code Azure account
@@ -689,15 +1054,18 @@ using Microsoft.Graph;
 var builder = WebApplication.CreateBuilder(args);
 
 // Create DefaultAzureCredential instance
-// This will work both locally (using developer credentials) and in Azure (using Managed Identity)
+// This will work both locally (using developer credentials) and in Azure (using User-Assigned MI)
+var managedIdentityClientId = builder.Configuration["ManagedIdentity:ClientId"];
+
 var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
 {
+    // CRITICAL: Specify User-Assigned Managed Identity Client ID
+    // This is REQUIRED for User-Assigned MI (without it, will try System-Assigned)
+    ManagedIdentityClientId = managedIdentityClientId,
+    
     // Exclude credentials you don't want to use (optional)
     ExcludeInteractiveBrowserCredential = true, // Don't open browser
     ExcludeSharedTokenCacheCredential = true,   // Optional: exclude if not needed
-
-    // Specify User-Assigned Managed Identity (if using UAMI instead of SAMI)
-    ManagedIdentityClientId = builder.Configuration["ManagedIdentity:ClientId"],
 
     // Enable logging for troubleshooting
     Diagnostics =
@@ -947,170 +1315,595 @@ public class SecretService : ISecretService
 }
 ```
 
-### 6.4.6 Local Development Setup
+### 6.4.6 Local Development - Quick Start
 
-**Prerequisites for local development** (DefaultAzureCredential will use these):
+**IMPORTANT**: Developers should use a **Development User-Assigned MI** (not personal Azure credentials) because:
+- ❌ Personal accounts lack Graph API application permissions (e.g., `Application.Read.All`)
+- ❌ These are admin-only permissions that can't be granted to individual developers
+- ✅ Development MI has the same permissions as production MI
+- ✅ All developers share the same identity and permissions
+- ✅ No individual admin permissions needed
 
-**Option 1: Azure CLI (Recommended)**
+**TL;DR - 3 Steps to Start Debugging Locally:**
 
 ```bash
-# Login to Azure
+# Step 1: Get Development MI Client ID (ask your IT admin or get it yourself)
+az login
+DEV_MI_CLIENT_ID=$(az identity show \
+  --name entra-portal-dev-identity \
+  --resource-group dev-rg \
+  --query clientId -o tsv)
+
+# Step 2: Initialize and set user secrets
+cd entra-id-app-portal.Web
+dotnet user-secrets init
+dotnet user-secrets set "ManagedIdentity:ClientId" "$DEV_MI_CLIENT_ID"
+dotnet user-secrets set "ManagedIdentity:Enabled" "true"
+dotnet user-secrets set "ManagedIdentity:UseManagedIdentityForGraph" "true"
+dotnet user-secrets set "Authorization:AdminGroupId" "your-admin-group-id"
+dotnet user-secrets set "Authorization:SupportGroupId" "your-support-group-id"
+
+# Step 3: Press F5 in Visual Studio - It just works!
+```
+
+**That's it!** The application will:
+- ✅ Load configuration from secrets.json (User Secrets)
+- ✅ Use **Development Managed Identity** for Graph API (same permissions as production!)
+- ✅ Use the same code as production (no conditional logic needed)
+- ✅ Work without individual developer admin permissions
+
+### 6.4.6.1 Development Managed Identity Setup (IT Admin Task)
+
+**One-Time Setup by IT Admin:**
+
+```bash
+# ============================================================================
+# STEP 1: Create Development User-Assigned Managed Identity
+# ============================================================================
+az identity create \
+  --name entra-portal-dev-identity \
+  --resource-group dev-rg \
+  --location eastus
+
+# Get the IDs
+DEV_MI_CLIENT_ID=$(az identity show --name entra-portal-dev-identity --resource-group dev-rg --query clientId -o tsv)
+DEV_MI_PRINCIPAL_ID=$(az identity show --name entra-portal-dev-identity --resource-group dev-rg --query principalId -o tsv)
+
+echo "Development MI Client ID: $DEV_MI_CLIENT_ID"
+echo "Development MI Principal ID: $DEV_MI_PRINCIPAL_ID"
+
+# ============================================================================
+# STEP 2: Grant Graph API Permissions (Same as Production MI)
+# ============================================================================
+```
+
+```powershell
+# PowerShell: Grant Microsoft Graph application permissions
+Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All"
+
+$devMIPrincipalId = "<dev-mi-principal-id>"
+$graphSp = Get-MgServicePrincipal -Filter "displayName eq 'Microsoft Graph'"
+
+# Grant same permissions as production
+$permissions = @(
+    "Application.Read.All",        # Or Application.ReadWrite.All
+    "Directory.Read.All",
+    "GroupMember.Read.All"
+)
+
+foreach ($permission in $permissions) {
+    $appRole = $graphSp.AppRoles | Where-Object { $_.Value -eq $permission }
+    
+    if ($appRole) {
+        New-MgServicePrincipalAppRoleAssignment `
+            -ServicePrincipalId $devMIPrincipalId `
+            -PrincipalId $devMIPrincipalId `
+            -ResourceId $graphSp.Id `
+            -AppRoleId $appRole.Id
+        
+        Write-Host "✅ Granted $permission to Development MI" -ForegroundColor Green
+    }
+}
+
+Write-Host "`n✅ Development Managed Identity configured!" -ForegroundColor Green
+Write-Host "Client ID for developers: $((Get-MgServicePrincipal -ServicePrincipalId $devMIPrincipalId).AppId)"
+```
+
+```bash
+# ============================================================================
+# STEP 3: Grant Development MI Access to Development Key Vault (Optional)
+# ============================================================================
+az role assignment create \
+  --role "Key Vault Secrets User" \
+  --assignee $DEV_MI_PRINCIPAL_ID \
+  --scope /subscriptions/<sub-id>/resourceGroups/dev-rg/providers/Microsoft.KeyVault/vaults/dev-keyvault
+
+# ============================================================================
+# STEP 4: Grant Developers Permission to Use the Development MI
+# ============================================================================
+# Developers need "Managed Identity Operator" role to use the MI
+az role assignment create \
+  --role "Managed Identity Operator" \
+  --assignee "developer1@company.com" \
+  --scope /subscriptions/<sub-id>/resourcegroups/dev-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/entra-portal-dev-identity
+
+# Repeat for each developer OR use Azure AD group:
+az role assignment create \
+  --role "Managed Identity Operator" \
+  --assignee-object-id "<developers-aad-group-object-id>" \
+  --assignee-principal-type Group \
+  --scope /subscriptions/<sub-id>/resourcegroups/dev-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/entra-portal-dev-identity
+
+echo "✅ Development MI setup complete!"
+echo "Share this Client ID with developers: $DEV_MI_CLIENT_ID"
+```
+
+### 6.4.6.2 Developer Machine Setup
+
+**Per Developer (One-Time Setup):**
+
+```bash
+# ============================================================================
+# Prerequisites
+# ============================================================================
+# 1. .NET 10 SDK installed
+# 2. Azure CLI installed
+# 3. Visual Studio 2022+ or VS Code
+
+# ============================================================================
+# STEP 1: Clone Repository
+# ============================================================================
+git clone <repository-url>
+cd entra-id-app-portal
+
+# ============================================================================
+# STEP 2: Login to Azure
+# ============================================================================
+# This is needed to authenticate to Azure and use the Development MI
 az login
 
-# Set default subscription (if you have multiple)
-az account set --subscription "<subscription-id>"
-
-# Verify login
+# Verify you're logged in and can access the subscription
 az account show
 
-# Your app will now use these credentials locally
+# ============================================================================
+# STEP 3: Get Development MI Client ID
+# ============================================================================
+# Option A: Ask your IT admin for the Client ID
+# Option B: Get it yourself (if you have access)
+DEV_MI_CLIENT_ID=$(az identity show \
+  --name entra-portal-dev-identity \
+  --resource-group dev-rg \
+  --query clientId -o tsv)
+
+echo "Development MI Client ID: $DEV_MI_CLIENT_ID"
+
+# ============================================================================
+# STEP 4: Configure User Secrets
+# ============================================================================
+cd entra-id-app-portal.Web
+
+# Initialize user secrets
+dotnet user-secrets init
+
+# Set Development MI configuration
+dotnet user-secrets set "ManagedIdentity:ClientId" "$DEV_MI_CLIENT_ID"
+dotnet user-secrets set "ManagedIdentity:Enabled" "true"
+dotnet user-secrets set "ManagedIdentity:UseManagedIdentityForGraph" "true"
+
+# Set group IDs (ask your admin or get from Azure Portal)
+dotnet user-secrets set "Authorization:AdminGroupId" "<admin-group-object-id>"
+dotnet user-secrets set "Authorization:SupportGroupId" "<support-group-object-id>"
+
+# Optional: Set for user authentication (if you want to test login)
+dotnet user-secrets set "AzureAd:ClientSecret" "<dev-app-registration-secret>"
+
+# List secrets to verify
+dotnet user-secrets list
+
+# ============================================================================
+# STEP 5: Press F5 to Debug!
+# ============================================================================
+# Open solution in Visual Studio or VS Code and press F5
+# The application will:
+# 1. Load configuration from secrets.json
+# 2. Use DefaultAzureCredential with Development MI Client ID
+# 3. Authenticate using the Development MI (via your Azure CLI login)
+# 4. Have the same permissions as production!
 ```
 
-**Option 2: Visual Studio Code**
+**How It Works - Development MI with Environment Variables:**
+
+Since Managed Identities only work on Azure resources (not local machines), we use **EnvironmentCredential** to simulate MI locally:
 
 ```bash
-# Install Azure Account extension
-# Sign in via Command Palette: "Azure: Sign In"
+# IT Admin: Get the Development MI credentials
+# The Development MI needs a way to authenticate locally
+# We'll use environment variables that DefaultAzureCredential understands
+
+# Option A: Use Service Principal with same permissions as Development MI
+# This is what we recommend because it works seamlessly
+
+# IT Admin creates a Service Principal for local development
+az ad sp create-for-rbac \
+  --name "entra-portal-dev-sp" \
+  --skip-assignment
+
+# Output includes:
+# - appId (Client ID)
+# - password (Client Secret)
+# - tenant
+
+# Grant this SP the SAME Graph API permissions as Development MI (using PowerShell)
+# See section 6.4.6.1 above - same PowerShell script, different principal ID
 ```
 
-**Option 3: Visual Studio**
-
-- Tools → Options → Azure Service Authentication
-- Sign in with your Azure account
-
-**Option 4: Environment Variables (for CI/CD or testing)**
+**Simplified Developer Setup:**
 
 ```bash
-# Set environment variables
-export AZURE_CLIENT_ID="<app-registration-client-id>"
-export AZURE_CLIENT_SECRET="<client-secret>"
-export AZURE_TENANT_ID="<tenant-id>"
+# After IT Admin creates the Development Service Principal
+# Developers set these in User Secrets:
+
+cd entra-id-app-portal.Web
+dotnet user-secrets init
+
+# Set the Service Principal credentials (acts as Development MI)
+dotnet user-secrets set "AZURE_CLIENT_ID" "<dev-sp-client-id>"
+dotnet user-secrets set "AZURE_CLIENT_SECRET" "<dev-sp-client-secret>"
+dotnet user-secrets set "AZURE_TENANT_ID" "<tenant-id>"
+
+# Set other required configuration
+dotnet user-secrets set "Authorization:AdminGroupId" "<admin-group-id>"
+dotnet user-secrets set "Authorization:SupportGroupId" "<support-group-id>"
+
+# Press F5 - DefaultAzureCredential automatically uses EnvironmentCredential!
 ```
+
+**How DefaultAzureCredential Works with This Approach:**
+
+```
+Developer presses F5
+  ↓
+DefaultAzureCredential created
+  ↓
+1. Checks EnvironmentCredential first
+   Looks for: AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID
+   ✅ Found in User Secrets! (mapped to environment variables)
+  ↓
+2. Uses Service Principal authentication
+   Authenticates as the Development SP (which has MI-like permissions)
+  ↓
+3. Acquires tokens from Azure AD
+   Token has Application permissions (Application.Read.All, etc.)
+  ↓
+4. Calls Graph API successfully!
+   Same permissions as Production MI!
+```
+
+**Authentication Options for Local Development:**
+
+| Method | Setup | Permissions | Recommended |
+|--------|-------|-------------|-------------|
+| **Development MI** | Use environment vars | Same as production | ✅ **Best** - Production parity |
+| **Service Principal** | Client ID + Secret | Same as production | ✅ **Best** - Easy to use |
+| **Azure CLI** | `az login` | Your personal permissions | ⚠️ Requires admin permissions |
+| **Visual Studio** | Tools → Options | Your personal permissions | ⚠️ Requires admin permissions |
+
+**Local Configuration Priority (Highest to Lowest):**
+1. Environment variables (`AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`) - **DefaultAzureCredential checks these first!**
+2. secrets.json (User Secrets) - **Store credentials here** (they get mapped to env vars)
+3. local.settings.json (if present)
+4. appsettings.Development.json
+5. appsettings.json
+
+### 6.4.6.3 Summary: Development MI Approach
+
+**Setup Overview:**
+
+| Step | Who | What | Why |
+|------|-----|------|-----|
+| 1. Create Development Service Principal | IT Admin | `az ad sp create-for-rbac` | Acts as Development MI locally |
+| 2. Grant Graph API Permissions | IT Admin | PowerShell script | Same permissions as Production MI |
+| 3. Share credentials with developers | IT Admin | Securely share Client ID + Secret | Via secure channel (Key Vault, password manager) |
+| 4. Set User Secrets | Each Developer | `dotnet user-secrets set` | Store credentials locally (not in git) |
+| 5. Press F5 | Each Developer | Debug | DefaultAzureCredential uses Service Principal |
+
+**Benefits:**
+- ✅ Developers have same permissions as production (no surprises!)
+- ✅ No personal admin permissions needed for developers
+- ✅ Works seamlessly with DefaultAzureCredential (no code changes)
+- ✅ Easy to rotate credentials (just update Service Principal secret)
+- ✅ Easy to revoke access (delete Service Principal)
+- ✅ Same code works in Azure with actual Managed Identity
+
+**Alternative (If you want to use actual MI locally):**
+Run development in Azure (VM, Container Instance, or App Service slot) with Development MI assigned. This gives you true MI authentication but requires running in Azure.
 
 ### 6.4.7 Azure Managed Identity Setup
 
-#### Step 1: Enable System-Assigned Managed Identity
+#### Step 1: Create User-Assigned Managed Identity
 
-**Azure App Service:**
+**IMPORTANT**: Create the User-Assigned Managed Identity BEFORE deploying the application. This allows you to configure permissions in advance.
+
+**Azure CLI:**
 
 ```bash
-# Enable system-assigned managed identity
+# Create User-Assigned Managed Identity
+az identity create \
+    --name entra-portal-identity \
+    --resource-group <resource-group-name> \
+    --location <location>
+
+# Capture the output - you'll need these values:
+# - clientId (Application/Client ID) - for configuration
+# - principalId (Object/Principal ID) - for granting permissions
+# - id (Resource ID) - for assigning to App Service
+
+# Get the IDs (if you need to retrieve them later)
+az identity show \
+    --name entra-portal-identity \
+    --resource-group <resource-group-name> \
+    --query "{clientId: clientId, principalId: principalId, id: id}" \
+    --output json
+```
+
+**Output Example:**
+```json
+{
+  "clientId": "12345678-1234-1234-1234-123456789abc",
+  "principalId": "87654321-4321-4321-4321-cba987654321",
+  "id": "/subscriptions/<sub-id>/resourcegroups/<rg>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/entra-portal-identity"
+}
+```
+
+**Azure Portal:**
+
+1. Navigate to Azure Portal
+2. Search for "Managed Identities"
+3. Click "+ Create"
+4. Select subscription, resource group, region
+5. Name: `entra-portal-identity`
+6. Click "Review + Create"
+7. After creation, copy:
+   - **Client ID** (for application configuration)
+   - **Principal ID** (for permission grants)
+   - **Resource ID** (for App Service assignment)
+
+#### Step 1b: Assign User-Assigned Managed Identity to App Service
+
+**Azure CLI:**
+
+```bash
+# Assign the User-Assigned MI to App Service
 az webapp identity assign \
     --name <app-name> \
-    --resource-group <resource-group-name>
+    --resource-group <resource-group-name> \
+    --identities /subscriptions/<sub-id>/resourcegroups/<rg>/providers/Microsoft.ManagedIdentity/userAssignedIdentities/entra-portal-identity
 
-# Output will include principalId (Object ID of the managed identity)
+# Verify assignment
+az webapp identity show \
+    --name <app-name> \
+    --resource-group <resource-group-name>
 ```
 
 **Azure Portal:**
 
 1. Navigate to App Service → Identity
-2. System assigned → Status: On
-3. Click Save
-4. Copy Object (principal) ID
+2. Click "User assigned" tab
+3. Click "+ Add"
+4. Select your managed identity: `entra-portal-identity`
+5. Click "Add"
 
-#### Step 2: Grant Managed Identity Access to Key Vault
-
-```bash
-# Grant Key Vault access
-az keyvault set-policy \
-    --name <key-vault-name> \
-    --object-id <managed-identity-principal-id> \
-    --secret-permissions get list
-
-# For Certificate access (if needed)
-az keyvault set-policy \
-    --name <key-vault-name> \
-    --object-id <managed-identity-principal-id> \
-    --certificate-permissions get list
+**IMPORTANT**: Add the Client ID to your configuration:
+```json
+{
+  "ManagedIdentity": {
+    "Enabled": true,
+    "ClientId": "12345678-1234-1234-1234-123456789abc"
+  }
+}
 ```
 
-**Or using Azure RBAC (Recommended):**
+#### Step 2: Grant User-Assigned Managed Identity Access to Key Vault
+
+**Using Azure RBAC (Recommended):**
 
 ```bash
-# Assign Key Vault Secrets User role
+# Get the Principal ID of the User-Assigned MI (if you don't have it)
+PRINCIPAL_ID=$(az identity show \
+    --name entra-portal-identity \
+    --resource-group <resource-group-name> \
+    --query principalId \
+    --output tsv)
+
+echo "Principal ID: $PRINCIPAL_ID"
+
+# Assign Key Vault Secrets User role to the User-Assigned MI
 az role assignment create \
     --role "Key Vault Secrets User" \
-    --assignee <managed-identity-principal-id> \
+    --assignee $PRINCIPAL_ID \
+    --scope /subscriptions/<subscription-id>/resourceGroups/<rg-name>/providers/Microsoft.KeyVault/vaults/<kv-name>
+
+# Verify role assignment
+az role assignment list \
+    --assignee $PRINCIPAL_ID \
     --scope /subscriptions/<subscription-id>/resourceGroups/<rg-name>/providers/Microsoft.KeyVault/vaults/<kv-name>
 ```
 
-#### Step 3: Grant Managed Identity Access to Microsoft Graph
+**Using Access Policies (Legacy - not recommended):**
 
-**CRITICAL**: Managed Identity needs Graph API permissions to call Graph on behalf of the application.
+```bash
+# Grant Key Vault access using access policies
+az keyvault set-policy \
+    --name <key-vault-name> \
+    --object-id $PRINCIPAL_ID \
+    --secret-permissions get list
+```
+
+#### Step 3: Grant User-Assigned Managed Identity Access to Microsoft Graph
+
+**CRITICAL**: The User-Assigned Managed Identity needs Graph API application permissions to call Microsoft Graph on behalf of the application (not user context).
 
 ```powershell
 # Connect to Microsoft Graph with admin privileges
 Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All"
 
-# Get the Managed Identity Service Principal
-$managedIdentityObjectId = "<managed-identity-principal-id>"
-$sp = Get-MgServicePrincipal -ServicePrincipalId $managedIdentityObjectId
+# Get the User-Assigned Managed Identity Service Principal (by Principal/Object ID)
+# Get this from: az identity show --name entra-portal-identity --query principalId -o tsv
+$managedIdentityPrincipalId = "<user-assigned-mi-principal-id>"  # NOT the Client ID!
+
+# Get the Service Principal object
+$managedIdentitySp = Get-MgServicePrincipal -ServicePrincipalId $managedIdentityPrincipalId
+
+Write-Host "Found User-Assigned MI: $($managedIdentitySp.DisplayName)"
+Write-Host "Principal ID: $($managedIdentitySp.Id)"
 
 # Get Microsoft Graph Service Principal
 $graphSp = Get-MgServicePrincipal -Filter "displayName eq 'Microsoft Graph'"
 
+Write-Host "Found Microsoft Graph SP: $($graphSp.Id)"
+
 # Define required Graph API permissions (Application permissions, not delegated)
 $permissions = @(
-    "Application.Read.All",        # Or Application.ReadWrite.All for delete
-    "Directory.Read.All",
-    "GroupMember.Read.All"
+    "Application.Read.All",        # Or Application.ReadWrite.All for delete operations
+    "Directory.Read.All",          # Read directory data
+    "GroupMember.Read.All"         # Read group memberships
 )
 
-# Assign permissions
+# Assign permissions to the User-Assigned Managed Identity
 foreach ($permission in $permissions) {
     $appRole = $graphSp.AppRoles | Where-Object { $_.Value -eq $permission }
 
     if ($appRole) {
-        New-MgServicePrincipalAppRoleAssignment `
-            -ServicePrincipalId $managedIdentityObjectId `
-            -PrincipalId $managedIdentityObjectId `
-            -ResourceId $graphSp.Id `
-            -AppRoleId $appRole.Id
+        try {
+            New-MgServicePrincipalAppRoleAssignment `
+                -ServicePrincipalId $managedIdentityPrincipalId `
+                -PrincipalId $managedIdentityPrincipalId `
+                -ResourceId $graphSp.Id `
+                -AppRoleId $appRole.Id
 
-        Write-Host "Granted $permission to Managed Identity"
+            Write-Host "✅ Granted $permission to User-Assigned Managed Identity" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "⚠️  Failed to grant $permission : $_" -ForegroundColor Yellow
+        }
+    }
+    else {
+        Write-Host "❌ Permission $permission not found" -ForegroundColor Red
     }
 }
+
+Write-Host "`n✅ User-Assigned Managed Identity configured successfully!" -ForegroundColor Green
+Write-Host "Client ID to use in configuration: $($managedIdentitySp.AppId)"
 ```
 
-**Alternative using Azure CLI:**
+**Alternative using Azure CLI and REST API:**
 
 ```bash
-# This is more complex - PowerShell method above is recommended
-# But here's the approach:
+# Get the User-Assigned MI Principal ID
+PRINCIPAL_ID=$(az identity show \
+    --name entra-portal-identity \
+    --resource-group <resource-group-name> \
+    --query principalId \
+    --output tsv)
 
-# Get Graph API service principal ID
-GRAPH_SP_ID=$(az ad sp list --display-name "Microsoft Graph" --query "[0].id" -o tsv)
+echo "User-Assigned MI Principal ID: $PRINCIPAL_ID"
 
-# Get the app role ID for Application.Read.All
-APP_ROLE_ID=$(az ad sp show --id $GRAPH_SP_ID --query "appRoles[?value=='Application.Read.All'].id" -o tsv)
+# Get Microsoft Graph Service Principal ID
+GRAPH_SP_ID=$(az ad sp list \
+    --display-name "Microsoft Graph" \
+    --query "[0].id" \
+    --output tsv)
 
-# Assign the role
-az rest --method POST \
-    --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$MANAGED_IDENTITY_OBJECT_ID/appRoleAssignments" \
-    --body "{'principalId':'$MANAGED_IDENTITY_OBJECT_ID','resourceId':'$GRAPH_SP_ID','appRoleId':'$APP_ROLE_ID'}"
+echo "Microsoft Graph SP ID: $GRAPH_SP_ID"
+
+# Function to grant permission
+grant_graph_permission() {
+    local PERMISSION=$1
+    
+    # Get the app role ID for the permission
+    APP_ROLE_ID=$(az ad sp show \
+        --id $GRAPH_SP_ID \
+        --query "appRoles[?value=='$PERMISSION'].id" \
+        --output tsv)
+    
+    if [ -z "$APP_ROLE_ID" ]; then
+        echo "❌ Permission $PERMISSION not found"
+        return 1
+    fi
+    
+    # Assign the role using Graph API REST
+    az rest --method POST \
+        --uri "https://graph.microsoft.com/v1.0/servicePrincipals/$PRINCIPAL_ID/appRoleAssignments" \
+        --headers "Content-Type=application/json" \
+        --body "{
+            \"principalId\": \"$PRINCIPAL_ID\",
+            \"resourceId\": \"$GRAPH_SP_ID\",
+            \"appRoleId\": \"$APP_ROLE_ID\"
+        }"
+    
+    echo "✅ Granted $PERMISSION to User-Assigned Managed Identity"
+}
+
+# Grant required permissions
+grant_graph_permission "Application.Read.All"
+grant_graph_permission "Directory.Read.All"
+grant_graph_permission "GroupMember.Read.All"
+
+echo "✅ All permissions granted successfully!"
 ```
 
-#### Step 4: Grant Access to Other Azure Resources
+#### Step 4: Grant User-Assigned Managed Identity Access to Other Azure Resources
+
+**Get the Principal ID (if not already set):**
+
+```bash
+PRINCIPAL_ID=$(az identity show \
+    --name entra-portal-identity \
+    --resource-group <resource-group-name> \
+    --query principalId \
+    --output tsv)
+```
 
 **Application Insights:**
 
 ```bash
-# Assign Monitoring Metrics Publisher role
+# Assign Monitoring Metrics Publisher role to User-Assigned MI
 az role assignment create \
     --role "Monitoring Metrics Publisher" \
-    --assignee <managed-identity-principal-id> \
+    --assignee $PRINCIPAL_ID \
     --scope /subscriptions/<subscription-id>/resourceGroups/<rg-name>/providers/Microsoft.Insights/components/<app-insights-name>
+
+# Verify
+az role assignment list --assignee $PRINCIPAL_ID --scope /subscriptions/<subscription-id>/resourceGroups/<rg-name>/providers/Microsoft.Insights/components/<app-insights-name>
 ```
 
-**Azure Cache for Redis:**
+**Azure Cache for Redis (if using):**
 
 ```bash
-# Assign Redis Cache Contributor role
+# Assign Redis Cache Contributor role to User-Assigned MI
 az role assignment create \
     --role "Redis Cache Contributor" \
-    --assignee <managed-identity-principal-id> \
+    --assignee $PRINCIPAL_ID \
     --scope /subscriptions/<subscription-id>/resourceGroups/<rg-name>/providers/Microsoft.Cache/Redis/<redis-name>
+```
+
+**Summary of User-Assigned MI Setup:**
+
+```bash
+# Quick reference script
+MI_NAME="entra-portal-identity"
+RG_NAME="<your-resource-group>"
+
+# Get IDs
+CLIENT_ID=$(az identity show --name $MI_NAME --resource-group $RG_NAME --query clientId -o tsv)
+PRINCIPAL_ID=$(az identity show --name $MI_NAME --resource-group $RG_NAME --query principalId -o tsv)
+MI_RESOURCE_ID=$(az identity show --name $MI_NAME --resource-group $RG_NAME --query id -o tsv)
+
+echo "User-Assigned Managed Identity Details:"
+echo "  Name: $MI_NAME"
+echo "  Client ID (for config): $CLIENT_ID"
+echo "  Principal ID (for permissions): $PRINCIPAL_ID"
+echo "  Resource ID (for assignment): $MI_RESOURCE_ID"
 ```
 
 ### 6.4.8 Troubleshooting DefaultAzureCredential
@@ -1137,9 +1930,12 @@ using AzureEventSourceListener listener = AzureEventSourceListener.CreateTraceLo
 
 2. **Azure: "ManagedIdentityCredential authentication failed"**
 
-   - Verify Managed Identity is enabled: Check App Service → Identity
-   - Verify permissions: Check Key Vault access policies or RBAC assignments
-   - Check Graph API permissions: Ensure app roles are assigned
+   - Verify User-Assigned MI is created and assigned to App Service
+   - Check App Service → Identity → User assigned tab
+   - Verify `ManagedIdentity:ClientId` is set correctly in configuration
+   - Verify permissions: Check Key Vault RBAC assignments for the Principal ID
+   - Check Graph API permissions: Ensure app roles are assigned to the Principal ID
+   - Verify the MI Resource ID is correctly assigned to the App Service
 
 3. **"AADSTS700016: Application not found in the directory"**
 
@@ -1181,51 +1977,122 @@ public async Task TestDefaultAzureCredential()
 ✅ **DO**:
 
 - Use `DefaultAzureCredential` for all Azure resource access
-- Enable System-Assigned Managed Identity in production
-- Use Azure CLI login for local development
+- **Create User-Assigned Managed Identity BEFORE deploying** (allows pre-configuration)
+- **Specify `ManagedIdentityClientId` in DefaultAzureCredential options**
+- Use Azure CLI login (`az login`) for local development
+- Store MI Client ID in configuration (it's not sensitive)
 - Log credential acquisition for troubleshooting
 - Use RBAC over access policies when possible
-- Rotate any development secrets regularly
-- Test with Managed Identity in staging environment first
+- Document MI Principal ID for permission grants
+- Test with User-Assigned MI in staging environment first
+- Reuse same User-Assigned MI across related resources (Web App, Functions, etc.)
 
 ❌ **DON'T**:
 
+- Don't use System-Assigned MI (use User-Assigned for better lifecycle management)
 - Don't store client secrets in code or appsettings.json (production)
 - Don't use client secrets in production (use Managed Identity)
-- Don't hardcode tenant IDs or client IDs in code
-- Don't expose Managed Identity Object IDs in client-side code
+- Don't hardcode tenant IDs in code (use configuration)
+- Don't expose Managed Identity Principal/Object IDs in client-side code
 - Don't grant excessive permissions (principle of least privilege)
 - Don't skip testing Managed Identity before production deployment
+- Don't forget to assign the User-Assigned MI to the App Service
+- Don't confuse Client ID (for config) with Principal ID (for permissions)
 
 ### 6.4.10 Environment-Specific Configuration
 
-**Development (appsettings.Development.json or User Secrets):**
+**IMPORTANT**: Same configuration structure, different values and sources!
+
+**Development - secrets.json (User Secrets):**
 
 ```json
 {
-  "ManagedIdentity": {
-    "Enabled": false,
-    "UseManagedIdentityForGraph": false
-  },
   "AzureAd": {
-    "ClientSecret": "<dev-client-secret>"
+    "ClientSecret": "your-dev-app-registration-secret"
+  },
+  "ManagedIdentity": {
+    "Enabled": false,  // Use Azure CLI credentials instead
+    "UseManagedIdentityForGraph": false  // Use delegated auth
+  },
+  "Authorization": {
+    "AdminGroupId": "your-admin-group-object-id",
+    "SupportGroupId": "your-support-group-object-id"
   }
 }
 ```
 
-**Production (Azure App Configuration or Key Vault):**
+**Development - appsettings.Development.json (Non-sensitive values):**
 
 ```json
 {
+  "Logging": {
+    "LogLevel": {
+      "Default": "Debug",
+      "Microsoft.AspNetCore": "Information"
+    }
+  },
+  "AzureAd": {
+    "Instance": "https://login.microsoftonline.com/",
+    "TenantId": "your-dev-tenant-id",
+    "ClientId": "your-dev-app-client-id",
+    "CallbackPath": "/signin-oidc"
+  },
+  "KeyVault": {
+    "VaultUri": "",  // Empty = Don't use Key Vault locally
+    "UseManagedIdentity": false
+  },
+  "GraphApi": {
+    "BaseUrl": "https://graph.microsoft.com/v1.0"
+  }
+}
+```
+
+**Production - Azure Key Vault (Secrets stored securely):**
+
+```bash
+# Store in Key Vault (accessed via Managed Identity - NO secrets in config!)
+az keyvault secret set --vault-name <vault-name> --name "Authorization--AdminGroupId" --value "<admin-group-id>"
+az keyvault secret set --vault-name <vault-name> --name "Authorization--SupportGroupId" --value "<support-group-id>"
+```
+
+**Production - Azure App Service Configuration (App Settings):**
+
+```json
+{
+  "AzureAd": {
+    "Instance": "https://login.microsoftonline.com/",
+    "TenantId": "production-tenant-id",
+    "ClientId": "production-app-client-id",
+    "CallbackPath": "/signin-oidc"
+  },
   "ManagedIdentity": {
-    "Enabled": true,
+    "Enabled": true,  // Use User-Assigned Managed Identity
+    "ClientId": "user-assigned-mi-client-id",
     "UseManagedIdentityForGraph": true
   },
-  "AzureAd": {
-    "ClientSecret": "" // Not used in production
+  "KeyVault": {
+    "VaultUri": "https://prod-keyvault.vault.azure.net/",
+    "UseManagedIdentity": true
   }
 }
 ```
+
+**Key Differences:**
+
+| Setting | Development | Production |
+|---------|-------------|------------|
+| **Secrets Source** | secrets.json (local file) | Azure Key Vault |
+| **Authentication** | Azure CLI (`az login`) | User-Assigned Managed Identity |
+| **ClientSecret** | In secrets.json | NOT used (MI instead) |
+| **ManagedIdentity:Enabled** | `false` | `true` |
+| **KeyVault:VaultUri** | Empty or commented out | Production Key Vault URL |
+| **Code Changes** | **ZERO!** | **ZERO!** |
+
+**The Magic**: DefaultAzureCredential automatically selects the right credential:
+- 🏠 **Local**: Uses Azure CLI credential from `az login`
+- ☁️ **Azure**: Uses User-Assigned Managed Identity
+
+**Same code, different credentials - zero configuration changes needed!**
 
 ---
 
@@ -2003,24 +2870,32 @@ Feature: Application Registration Filtering
 
 ### 12.1 Azure Resources
 
-| Resource                 | Purpose                                | SKU/Tier                    | Managed Identity Required |
-| ------------------------ | -------------------------------------- | --------------------------- | ------------------------- |
-| Azure App Service        | Host web app and API                   | B1 (Basic) or S1 (Standard) | ✅ **System-Assigned MI** |
-| Azure Key Vault          | Store secrets (NOT client secrets)     | Standard                    | ✅ Access granted to MI   |
-| Azure Cache for Redis    | Distributed cache (optional)           | Basic C0                    | ✅ Access granted to MI   |
-| Application Insights     | Monitoring and telemetry               | Pay-as-you-go               | ✅ Access granted to MI   |
-| Azure Container Registry | Container images (if using containers) | Basic                       | ✅ Access granted to MI   |
+| Resource                 | Purpose                                | SKU/Tier                    | Managed Identity Required          |
+| ------------------------ | -------------------------------------- | --------------------------- | ---------------------------------- |
+| **User-Assigned MI**     | Identity for accessing all resources   | N/A                         | ✅ **Create FIRST**                |
+| Azure App Service        | Host web app and API                   | B1 (Basic) or S1 (Standard) | ✅ Assign User-Assigned MI         |
+| Azure Key Vault          | Store secrets (NOT client secrets)     | Standard                    | ✅ Grant MI "Key Vault Secrets User" |
+| Azure Cache for Redis    | Distributed cache (optional)           | Basic C0                    | ✅ Grant MI "Redis Cache Contributor" |
+| Application Insights     | Monitoring and telemetry               | Pay-as-you-go               | ✅ Grant MI "Monitoring Metrics Publisher" |
+| Azure Container Registry | Container images (if using containers) | Basic                       | ✅ Grant MI "AcrPull" role         |
 
-**Managed Identity Setup**: All Azure resources must be accessed using the App Service's System-Assigned Managed Identity. No client secrets or connection strings should be stored in configuration.
+**Managed Identity Setup**: 
+1. Create User-Assigned Managed Identity (`entra-portal-identity`) **FIRST**
+2. Grant it permissions to all Azure resources (Key Vault, Graph API, etc.)
+3. Assign it to App Service/Container Apps
+4. Configure `ManagedIdentity:ClientId` in application settings
+5. No client secrets or connection strings in configuration
 
 ### 12.2 Deployment Options
 
 **Option 1: Azure App Service (Direct Deploy)**
 
+- Create User-Assigned Managed Identity FIRST
+- Grant permissions to MI (Key Vault, Graph API)
 - Build and publish from CI/CD pipeline
 - Deploy as .NET application
-- **Enable System-Assigned Managed Identity**
-- Configure Key Vault access for Managed Identity
+- **Assign User-Assigned Managed Identity to App Service**
+- Configure `ManagedIdentity:ClientId` in App Settings
 - No secrets in deployment configuration
 
 **Option 2: Container-based (Preferred for Aspire)**
@@ -2228,9 +3103,11 @@ jobs:
    - Never log sensitive data (tokens, secrets, passwords, PII)
    - Encrypt data in transit (TLS 1.3 or 1.2+)
    - Use Azure Key Vault for all secrets and certificates
+   - **Development Service Principal credentials** in User Secrets only (never in git)
    - Never expose group Object IDs in client-side code or error messages
    - Sanitize all user inputs
    - Implement proper CORS policy
+   - Rotate Development SP credentials regularly (quarterly recommended)
 
 4. **API Security**:
 
@@ -2270,37 +3147,112 @@ jobs:
 
 ## 14. Development Guidelines
 
-### 14.1 Code Standards
+### 14.1 Local Development Workflow
+
+**First-Time Setup (One-time):**
+
+```bash
+# 1. Clone repository
+git clone <repository-url>
+cd entra-id-app-portal
+
+# 2. Install dependencies
+dotnet restore
+
+# 3. Login to Azure (for DefaultAzureCredential)
+az login
+
+# 4. Initialize user secrets
+cd entra-id-app-portal.Web
+dotnet user-secrets init
+
+# 5. Set required secrets
+dotnet user-secrets set "AzureAd:ClientSecret" "your-dev-secret"
+dotnet user-secrets set "Authorization:AdminGroupId" "admin-group-id"
+dotnet user-secrets set "Authorization:SupportGroupId" "support-group-id"
+
+# 6. Return to solution root
+cd ..
+
+# 7. Open in IDE
+# Visual Studio: Open .sln file
+# VS Code: code .
+```
+
+**Daily Development Workflow:**
+
+```bash
+# 1. Pull latest changes
+git pull
+
+# 2. Restore packages (if needed)
+dotnet restore
+
+# 3. Ensure Azure CLI is still logged in
+az account show  # If expired, run: az login
+
+# 4. Press F5 to debug!
+# - Configuration loads automatically (secrets.json → appsettings.Development.json)
+# - DefaultAzureCredential uses your Azure CLI credentials
+# - Same code works in Azure production!
+```
+
+**Debugging Tips:**
+
+- ✅ Set breakpoints in Visual Studio/VS Code as normal
+- ✅ Use Hot Reload for rapid UI changes (Blazor)
+- ✅ Check Console output for configuration diagnostics
+- ✅ Use Browser DevTools for front-end debugging
+- ✅ Application Insights works locally too (if configured)
+
+**Common Issues & Solutions:**
+
+| Issue | Solution |
+|-------|----------|
+| "DefaultAzureCredential failed" | Run `az login` and verify with `az account show` |
+| "Configuration key not found" | Check secrets.json: `dotnet user-secrets list` |
+| "Unauthorized Graph API call" | Ensure your Azure account has permissions in dev tenant |
+| "Key Vault access denied" | Set `KeyVault:VaultUri` to empty string in appsettings.Development.json |
+
+### 14.2 Code Standards
 
 - Follow Microsoft C# coding conventions
 - Use StyleCop for code analysis
 - XML documentation for public APIs
 - Meaningful names (no abbreviations)
+- **Never commit secrets** - Use User Secrets for development
 
-### 14.2 Git Workflow
+### 14.3 Git Workflow
 
 - Feature branches: `feature/description`
 - Bug fixes: `bugfix/description`
 - Pull requests required for main branch
 - Commit messages: Use conventional commits
+- **Always verify .gitignore** excludes secrets.json and local.settings.json
 
-### 14.3 Code Review Checklist
+### 14.4 Code Review Checklist
 
 - [ ] Code follows style guidelines
 - [ ] Unit tests added/updated
-- [ ] No hardcoded secrets
+- [ ] **No hardcoded secrets or credentials**
+- [ ] **No secrets in appsettings.json or appsettings.Development.json**
 - [ ] Error handling implemented
 - [ ] Logging added for important operations
 - [ ] XML comments added
 - [ ] No console warnings or errors
+- [ ] Configuration works both locally and in Azure (test DefaultAzureCredential)
+- [ ] User Secrets used for local sensitive data
+- [ ] .gitignore properly excludes secrets
 
-### 14.4 Performance Considerations
+### 14.5 Performance Considerations
 
 - Use async/await properly
 - Avoid N+1 queries
 - Implement pagination for large datasets
 - Cache frequently accessed data
 - Use connection pooling
+- **Reuse TokenCredential instances** (register as Singleton)
+- **Cache Graph API results** appropriately
 
 ---
 
@@ -2392,6 +3344,72 @@ Configure alerts for:
 - [ ] Security review passed
 - [ ] User acceptance testing completed
 
+### Developer Onboarding Checklist (Local Setup):
+
+**Prerequisites:**
+- [ ] .NET 10 SDK installed
+- [ ] Visual Studio 2022+ or VS Code installed
+- [ ] Git installed
+- [ ] Obtain Development Service Principal credentials from IT Admin:
+  - Client ID (Application ID)
+  - Client Secret
+  - Tenant ID
+  - Group Object IDs
+
+**Setup (< 5 minutes):**
+- [ ] Clone repository: `git clone <repo-url>`
+- [ ] Navigate to project: `cd entra-id-app-portal`
+- [ ] Restore dependencies: `dotnet restore`
+- [ ] Navigate to Web project: `cd entra-id-app-portal.Web`
+- [ ] Initialize user secrets: `dotnet user-secrets init`
+- [ ] Set Development Service Principal credentials (acts as Development MI):
+  ```bash
+  # These enable DefaultAzureCredential to work locally with MI-like permissions
+  dotnet user-secrets set "AZURE_CLIENT_ID" "<dev-sp-client-id>"
+  dotnet user-secrets set "AZURE_CLIENT_SECRET" "<dev-sp-client-secret>"
+  dotnet user-secrets set "AZURE_TENANT_ID" "<tenant-id>"
+  
+  # Set group IDs for authorization
+  dotnet user-secrets set "Authorization:AdminGroupId" "<admin-group-object-id>"
+  dotnet user-secrets set "Authorization:SupportGroupId" "<support-group-object-id>"
+  
+  # Optional: For user authentication testing
+  dotnet user-secrets set "AzureAd:ClientSecret" "<user-auth-app-secret>"
+  ```
+- [ ] Verify secrets: `dotnet user-secrets list`
+- [ ] Press **F5** to debug - IT WORKS! 🎉
+
+**Verification:**
+- [ ] Application starts successfully
+- [ ] DefaultAzureCredential uses Service Principal (check logs)
+- [ ] Can access Graph API (loads app registrations) with Application permissions
+- [ ] Can login with Azure AD credentials (user authentication)
+- [ ] Configuration loads from secrets.json
+- [ ] No secrets in appsettings.Development.json or committed to git
+
+**What's Happening Under the Hood:**
+1. ✅ DefaultAzureCredential reads `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID` from User Secrets
+2. ✅ Uses EnvironmentCredential to authenticate as Development Service Principal
+3. ✅ Service Principal has same Graph API permissions as Production MI
+4. ✅ Application works exactly like production (same permissions!)
+5. ✅ NO personal admin permissions needed for developers
+
+**Troubleshooting:**
+| Issue | Solution |
+|-------|----------|
+| "DefaultAzureCredential failed" | Verify `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID` are set in secrets |
+| "Unauthorized Graph API call" | Contact IT Admin - Development SP may need Graph API permissions |
+| "Configuration key not found" | Run `dotnet user-secrets list` to verify all required secrets |
+| "Can't login to portal" | Check `AzureAd:ClientSecret` is set for user authentication |
+
+**Tips:**
+- ✅ Check configuration: `dotnet user-secrets list`
+- ✅ Same code works in Azure with Managed Identity (no changes needed!)
+- ✅ All developers use same Service Principal (easy to manage)
+- ✅ Credentials stored locally only (never in git)
+
+---
+
 ### Launch Checklist:
 
 **Entra ID Setup:**
@@ -2410,8 +3428,10 @@ Configure alerts for:
 
 **Managed Identity Setup (CRITICAL):**
 
-- [ ] **System-Assigned Managed Identity enabled on App Service**
-- [ ] **Managed Identity Object/Principal ID documented**
+- [ ] **User-Assigned Managed Identity created** (`entra-portal-identity`)
+- [ ] **MI Client ID documented** (for application configuration)
+- [ ] **MI Principal ID documented** (for permission grants)
+- [ ] **MI Resource ID documented** (for App Service assignment)
 - [ ] **Managed Identity granted Graph API application permissions**:
   - [ ] Application.Read.All (or Application.ReadWrite.All for delete)
   - [ ] Directory.Read.All
@@ -2419,6 +3439,8 @@ Configure alerts for:
   - [ ] Permissions granted via PowerShell (New-MgServicePrincipalAppRoleAssignment)
 - [ ] **Managed Identity granted Key Vault access** (RBAC: "Key Vault Secrets User")
 - [ ] **Managed Identity granted Application Insights access** (if using MI for telemetry)
+- [ ] **User-Assigned MI assigned to App Service** (via Azure Portal or CLI)
+- [ ] **ManagedIdentity:ClientId configured in App Settings**
 - [ ] **Managed Identity tested** (acquire token successfully)
 
 **Azure Resources:**
@@ -2563,8 +3585,10 @@ Configure alerts for:
 **Managed Identity (Production):**
 
 - [ ] `ManagedIdentity:Enabled` - Set to true in production
+- [ ] `ManagedIdentity:ClientId` - Set to User-Assigned MI Client ID
 - [ ] `ManagedIdentity:UseManagedIdentityForGraph` - Set to true in production
-- [ ] System-Assigned Managed Identity enabled on App Service
+- [ ] User-Assigned Managed Identity created
+- [ ] User-Assigned MI assigned to App Service
 - [ ] Managed Identity granted Graph API application permissions
 - [ ] Managed Identity granted Key Vault access
 
@@ -2647,41 +3671,112 @@ Configure alerts for:
 
 ---
 
-## 20. Implementation Summary - Managed Identity Best Practices
+## 20. Implementation Summary - Managed Identity & Developer Experience
 
-### Key Security Implementation
+### Key Features
 
-This application implements **Azure Managed Identity with DefaultAzureCredential** following Microsoft's best practices:
+This application implements **Azure Managed Identity with DefaultAzureCredential** and provides an **exceptional developer experience**:
+
+✅ **Zero Secrets in Production** - User-Assigned Managed Identity for all Azure resources  
+✅ **Same Code Everywhere** - No conditional logic for local vs Azure  
+✅ **Production-Like Permissions Locally** - Development Service Principal has same permissions as Production MI  
+✅ **F5 Debugging** - Set credentials in User Secrets and press F5  
+✅ **User Secrets** - Sensitive data in secrets.json, never in git  
+✅ **DefaultAzureCredential** - Automatically picks right auth method  
+✅ **Easy Onboarding** - Developers productive in < 5 minutes  
+✅ **No Personal Admin Permissions Needed** - Developers use shared Service Principal
 
 #### 1. **Credential Flow (DefaultAzureCredential Chain)**
 
 ```
 Development (Local):
-  User runs: az login
+  Developer sets AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID in User Secrets
     ↓
-  DefaultAzureCredential uses AzureCliCredential
+  Program.cs maps secrets to environment variables
     ↓
-  Application authenticates as the developer
+  DefaultAzureCredential uses EnvironmentCredential (checks env vars first!)
     ↓
-  Accesses Azure resources with developer's permissions
+  Authenticates as Development Service Principal
+    ↓
+  Service Principal has same Graph API permissions as Production MI
+    ↓
+  Application works exactly like production (same permissions!)
+    ↓
+  No personal admin permissions needed for developers!
 
 Production (Azure):
-  App Service has System-Assigned Managed Identity
+  User-Assigned Managed Identity created and assigned to App Service
     ↓
-  DefaultAzureCredential uses ManagedIdentityCredential
+  ManagedIdentity:ClientId configured in app settings
     ↓
-  Application authenticates as the Managed Identity
+  DefaultAzureCredential uses ManagedIdentityCredential (with Client ID)
+    ↓
+  Application authenticates as the User-Assigned Managed Identity
     ↓
   Accesses Azure resources with MI's assigned permissions
 ```
 
-#### 2. **Resource Access Pattern**
+#### 2. **Local Development Experience (< 5 minutes to start)**
 
-All Azure services are accessed using the same pattern:
+```bash
+# Step 1: Install prerequisites (one-time)
+# - .NET 10 SDK
+# - Get Development Service Principal credentials from IT Admin
+
+# Step 2: Clone repository (one-time)
+git clone <repo-url>
+cd entra-id-app-portal
+
+# Step 3: Set secrets (one-time)
+cd entra-id-app-portal.Web
+dotnet user-secrets init
+
+# Set Development Service Principal credentials (acts as Development MI)
+dotnet user-secrets set "AZURE_CLIENT_ID" "<dev-sp-client-id>"
+dotnet user-secrets set "AZURE_CLIENT_SECRET" "<dev-sp-client-secret>"
+dotnet user-secrets set "AZURE_TENANT_ID" "<tenant-id>"
+dotnet user-secrets set "Authorization:AdminGroupId" "<group-id>"
+dotnet user-secrets set "Authorization:SupportGroupId" "<group-id>"
+
+# Step 4: Press F5 - IT JUST WORKS! 🎉
+# - Configuration loads from secrets.json
+# - DefaultAzureCredential uses Service Principal (via EnvironmentCredential)
+# - Service Principal has same permissions as Production MI
+# - Same code runs in Azure (no changes!)
+```
+
+**Configuration Loading (Automatic):**
+```
+Local Development:
+  1. secrets.json (User Secrets) ← Sensitive values
+  2. local.settings.json (if present) ← Local overrides
+  3. appsettings.Development.json ← Development settings
+  4. appsettings.json ← Base configuration
+  5. Environment variables ← Fallback
+
+Azure Production:
+  1. Azure Key Vault (via Managed Identity) ← Secrets
+  2. App Service Configuration ← App Settings
+  3. appsettings.json ← Base configuration
+  4. Environment variables ← Fallback
+```
+
+**Same Code, Different Credentials:**
+- 🏠 **Local**: Development Service Principal (via EnvironmentCredential) → Same permissions as Production MI
+- ☁️ **Azure**: User-Assigned Managed Identity → Production permissions
+- 🚀 **Zero code changes** between environments!
+- ✅ **Both use application permissions** (not delegated) - true production parity!
+
+#### 3. **Resource Access Pattern**
+
+All Azure services are accessed using the same pattern (works locally AND in Azure):
 
 ```csharp
 // Single credential instance for all services
-var credential = new DefaultAzureCredential();
+var credential = new DefaultAzureCredential(new DefaultAzureCredentialOptions
+{
+    ManagedIdentityClientId = config["ManagedIdentity:ClientId"]  // Used in Azure, ignored locally
+});
 
 // Key Vault
 var secretClient = new SecretClient(vaultUri, credential);
@@ -2691,19 +3786,30 @@ var graphClient = new GraphServiceClient(credential, scopes);
 
 // Application Insights (automatic with MI)
 builder.Services.AddApplicationInsightsTelemetry();
+
+// No environment detection needed - it just works!
 ```
 
-#### 3. **Zero-Secrets Checklist**
+#### 4. **Zero-Secrets Checklist**
 
+**Production (Azure):**
 ✅ **NO** `ClientSecret` in production configuration  
 ✅ **NO** connection strings with passwords  
 ✅ **NO** API keys in environment variables  
 ✅ **NO** SAS tokens hardcoded  
 ✅ All credentials acquired automatically by Azure  
-✅ Developers use their own Azure credentials locally  
-✅ Production uses Managed Identity exclusively
+✅ Production uses User-Assigned Managed Identity exclusively
 
-#### 4. **Required NuGet Packages**
+**Development (Local):**
+✅ Credentials in `secrets.json` (User Secrets) - **NOT in git**  
+✅ Developers use **Development Service Principal** (shared, not personal)  
+✅ Service Principal has **same permissions as Production MI**  
+✅ Same configuration structure as production  
+✅ Easy to debug and test locally  
+✅ No personal admin permissions needed  
+✅ No environment detection code needed
+
+#### 5. **Required NuGet Packages**
 
 ```xml
 <!-- Core Azure Identity -->
@@ -2719,36 +3825,65 @@ builder.Services.AddApplicationInsightsTelemetry();
 <PackageReference Include="Microsoft.Identity.Web.MicrosoftGraph" Version="3.*" />
 ```
 
-#### 5. **Managed Identity Setup Commands**
+#### 6. **User-Assigned Managed Identity Setup Commands**
 
 ```bash
-# Enable System-Assigned MI on App Service
-az webapp identity assign --name <app-name> --resource-group <rg-name>
+# 1. Create User-Assigned Managed Identity
+az identity create \
+  --name entra-portal-identity \
+  --resource-group <rg-name> \
+  --location <location>
 
-# Grant Key Vault access
+# 2. Get the IDs
+CLIENT_ID=$(az identity show --name entra-portal-identity --resource-group <rg-name> --query clientId -o tsv)
+PRINCIPAL_ID=$(az identity show --name entra-portal-identity --resource-group <rg-name> --query principalId -o tsv)
+MI_RESOURCE_ID=$(az identity show --name entra-portal-identity --resource-group <rg-name> --query id -o tsv)
+
+echo "Client ID (for config): $CLIENT_ID"
+echo "Principal ID (for permissions): $PRINCIPAL_ID"
+
+# 3. Grant Key Vault access
 az role assignment create \
   --role "Key Vault Secrets User" \
-  --assignee <mi-principal-id> \
+  --assignee $PRINCIPAL_ID \
   --scope /subscriptions/<sub-id>/resourceGroups/<rg>/providers/Microsoft.KeyVault/vaults/<kv-name>
+
+# 4. Assign to App Service
+az webapp identity assign \
+  --name <app-name> \
+  --resource-group <rg-name> \
+  --identities $MI_RESOURCE_ID
+
+# 5. Configure Client ID in App Settings
+az webapp config appsettings set \
+  --name <app-name> \
+  --resource-group <rg-name> \
+  --settings ManagedIdentity__ClientId=$CLIENT_ID ManagedIdentity__Enabled=true
 ```
 
 ```powershell
-# Grant Graph API permissions to Managed Identity
-Connect-MgGraph -Scopes "Application.ReadWrite.All"
+# Grant Graph API permissions to User-Assigned Managed Identity
+Connect-MgGraph -Scopes "Application.ReadWrite.All", "AppRoleAssignment.ReadWrite.All"
 
-$managedIdentityObjectId = "<mi-principal-id>"
+# Replace with your User-Assigned MI Principal ID
+$managedIdentityPrincipalId = "<user-assigned-mi-principal-id>"
 $graphSp = Get-MgServicePrincipal -Filter "displayName eq 'Microsoft Graph'"
 
-# Assign Application.Read.All permission
-$appRole = $graphSp.AppRoles | Where-Object { $_.Value -eq "Application.Read.All" }
-New-MgServicePrincipalAppRoleAssignment `
-  -ServicePrincipalId $managedIdentityObjectId `
-  -PrincipalId $managedIdentityObjectId `
-  -ResourceId $graphSp.Id `
-  -AppRoleId $appRole.Id
+# Grant multiple permissions
+$permissions = @("Application.Read.All", "Directory.Read.All", "GroupMember.Read.All")
+
+foreach ($permission in $permissions) {
+    $appRole = $graphSp.AppRoles | Where-Object { $_.Value -eq $permission }
+    New-MgServicePrincipalAppRoleAssignment `
+      -ServicePrincipalId $managedIdentityPrincipalId `
+      -PrincipalId $managedIdentityPrincipalId `
+      -ResourceId $graphSp.Id `
+      -AppRoleId $appRole.Id
+    Write-Host "✅ Granted $permission"
+}
 ```
 
-#### 6. **Benefits Achieved**
+#### 7. **Benefits Achieved**
 
 | Benefit                      | Description                                 |
 | ---------------------------- | ------------------------------------------- |
@@ -2760,7 +3895,7 @@ New-MgServicePrincipalAppRoleAssignment `
 | ♻️ **No Rotation Required**  | Azure handles credential lifecycle          |
 | 🎯 **Least Privilege**       | Fine-grained RBAC permissions per resource  |
 
-#### 7. **Authentication Architecture**
+#### 8. **Authentication Architecture**
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -2796,7 +3931,7 @@ New-MgServicePrincipalAppRoleAssignment `
     └─────────────────┘           └──────────────────┘
 ```
 
-#### 8. **Troubleshooting Quick Reference**
+#### 9. **Troubleshooting Quick Reference**
 
 | Issue                                     | Solution                                         |
 | ----------------------------------------- | ------------------------------------------------ |
@@ -2806,22 +3941,42 @@ New-MgServicePrincipalAppRoleAssignment `
 | "AADSTS700016" Graph API error            | Grant Graph API app roles to MI using PowerShell |
 | Token acquisition slow                    | Check MI is enabled and permissions are correct  |
 
-#### 9. **Critical Deployment Steps**
+#### 10. **Critical Deployment Steps**
 
-1. ✅ Enable System-Assigned Managed Identity on App Service
-2. ✅ Grant MI access to Key Vault (RBAC: Key Vault Secrets User)
-3. ✅ Grant MI access to Microsoft Graph (PowerShell: App Role Assignment)
-4. ✅ Update configuration: `ManagedIdentity:Enabled = true`
-5. ✅ Update configuration: `ManagedIdentity:UseManagedIdentityForGraph = true`
-6. ✅ Remove any client secrets from production configuration
-7. ✅ Test token acquisition in staging environment first
-8. ✅ Verify all Graph API calls work with MI
-9. ✅ Verify Key Vault access works with MI
-10. ✅ Deploy to production
+**Pre-Deployment (Create Identity & Configure Permissions):**
+1. ✅ Create User-Assigned Managed Identity (`entra-portal-identity`)
+2. ✅ Document Client ID (for app config) and Principal ID (for permissions)
+3. ✅ Grant MI access to Key Vault (RBAC: "Key Vault Secrets User")
+4. ✅ Grant MI access to Microsoft Graph (PowerShell: App Role Assignment)
+   - Application.Read.All (or Application.ReadWrite.All)
+   - Directory.Read.All
+   - GroupMember.Read.All
+5. ✅ Grant MI access to Application Insights (if needed)
+
+**Deployment Configuration:**
+6. ✅ Update configuration: `ManagedIdentity:Enabled = true`
+7. ✅ Update configuration: `ManagedIdentity:ClientId = <user-assigned-mi-client-id>`
+8. ✅ Update configuration: `ManagedIdentity:UseManagedIdentityForGraph = true`
+9. ✅ Remove any client secrets from production configuration
+10. ✅ Verify `DefaultAzureCredential` includes `ManagedIdentityClientId` in options
+
+**App Service Setup:**
+11. ✅ Assign User-Assigned MI to App Service (Azure Portal or CLI)
+12. ✅ Configure App Settings with MI Client ID
+13. ✅ Test token acquisition in staging environment first
+
+**Verification:**
+14. ✅ Verify MI can acquire token for Graph API
+15. ✅ Verify all Graph API calls work with MI
+16. ✅ Verify Key Vault access works with MI
+17. ✅ Test application end-to-end in staging
+18. ✅ Deploy to production
 
 ---
 
-**Document Version**: 2.0 (Updated with Managed Identity)  
+**Document Version**: 2.3 (User-Assigned MI + Development Service Principal)  
 **Last Updated**: November 22, 2025  
 **Status**: Ready for Development  
-**Security Model**: Zero-Secrets Architecture with Managed Identity
+**Security Model**: Zero-Secrets Architecture with User-Assigned Managed Identity  
+**Developer Experience**: Development Service Principal provides production-like permissions locally - Set credentials in User Secrets and F5!  
+**Key Innovation**: Developers don't need admin permissions - Use shared Development SP with MI-like permissions
