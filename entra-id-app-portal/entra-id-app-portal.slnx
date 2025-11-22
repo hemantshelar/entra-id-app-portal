@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="entra-id-app-portal.ApiService/entra-id-app-portal.ApiService.csproj" />
+  <Project Path="entra-id-app-portal.AppHost/entra-id-app-portal.AppHost.csproj" />
+  <Project Path="entra-id-app-portal.ServiceDefaults/entra-id-app-portal.ServiceDefaults.csproj" />
+  <Project Path="entra-id-app-portal.Tests/entra-id-app-portal.Tests.csproj" />
+  <Project Path="entra-id-app-portal.Web/entra-id-app-portal.Web.csproj" />
+</Solution>
